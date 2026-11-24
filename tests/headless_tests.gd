@@ -7,6 +7,8 @@ const SM = preload("res://scripts/space_model.gd")
 const ST = preload("res://scripts/storage.gd")
 const RB = preload("res://scripts/room_builder.gd")
 const PS = preload("res://scripts/portal_system.gd")
+const PC = preload("res://scripts/player_controller.gd")
+const MV = preload("res://scripts/memory_node_view.gd")
 
 var _checks := 0
 var _failures := 0
@@ -28,10 +30,15 @@ func near_v3(a: Vector3, b: Vector3, eps: float = 1e-4) -> bool:
 
 
 func _init() -> void:
+	_run()
+
+
+func _run() -> void:
 	test_split_and_stretch()
 	test_stretch_z_axis()
 	test_portal_placement()
 	test_layer_allocation()
+	test_deletions()
 	test_portal_matrix()
 	test_hashing_and_assets()
 	test_import_sources()
@@ -40,6 +47,12 @@ func _init() -> void:
 	test_settings()
 	test_room_builder_logic()
 	test_portal_system_logic()
+	test_memory_loaders()
+	test_memory_views()
+	test_player_logic()
+	await test_player_physics()
+	await test_player_stairs()
+	await test_main_scene()
 	print("checks=%d failures=%d" % [_checks, _failures])
 	var ok := _failures == 0
 	print("RESULT: PASS" if ok else "RESULT: FAIL")
@@ -882,3 +895,451 @@ func test_portal_system_logic() -> void:
 	check(L.recess_needed(pa, Vector3(7.95, 1.2, 2.5)), "貼近門且在門洞前：需要凹陷")
 	check(not L.recess_needed(pa, Vector3(6.0, 1.2, 2.5)), "離門很遠：不需要")
 	check(not L.recess_needed(pa, Vector3(7.95, 1.2, 4.5)), "貼牆但不在門洞前：不需要")
+
+
+# ------------------------------------------------------------------ (5) 記憶節點外觀、玩家控制
+
+func _png_bytes(w: int, h: int) -> PackedByteArray:
+	var img := Image.create_empty(w, h, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.2, 0.6, 0.9))
+	return img.save_png_to_buffer()
+
+
+## 手工組一個只有一個三角形的 GLB（POSITION + 16 位元索引）
+func _glb_triangle_bytes() -> PackedByteArray:
+	var bin := StreamPeerBuffer.new()
+	for f in [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 4.0, 0.0]:
+		bin.put_float(f)
+	for i in [0, 1, 2]:
+		bin.put_u16(i)
+	bin.put_u16(0)    # 補齊到 4 位元組倍數
+	var bin_bytes: PackedByteArray = bin.data_array
+	var js := {
+		"asset": {"version": "2.0"},
+		"scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+		"meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+		"buffers": [{"byteLength": bin_bytes.size()}],
+		"bufferViews": [
+			{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+			{"buffer": 0, "byteOffset": 36, "byteLength": 6, "target": 34963},
+		],
+		"accessors": [
+			{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [2, 4, 0]},
+			{"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+		],
+	}
+	var json_bytes := JSON.stringify(js).to_utf8_buffer()
+	while json_bytes.size() % 4 != 0:
+		json_bytes.append(0x20)
+	var out := StreamPeerBuffer.new()
+	out.put_u32(0x46546C67)
+	out.put_u32(2)
+	out.put_u32(12 + 8 + json_bytes.size() + 8 + bin_bytes.size())
+	out.put_u32(json_bytes.size())
+	out.put_u32(0x4E4F534A)
+	out.put_data(json_bytes)
+	out.put_u32(bin_bytes.size())
+	out.put_u32(0x004E4942)
+	out.put_data(bin_bytes)
+	return out.data_array
+
+
+const _OBJ_CUBE := """# cube
+v 0 0 0
+v 2 0 0
+v 2 2 0
+v 0 2 0
+v 0 0 2
+v 2 0 2
+v 2 2 2
+v 0 2 2
+f 1 2 3 4
+f 5 8 7 6
+f 1 5 6 2
+f 2 6 7 3
+f 3 7 8 4
+f 5 1 4 8
+"""
+
+
+func test_memory_loaders() -> void:
+	print("[5a] 記憶節點載入器：圖片 / OBJ / GLB")
+	var L = MV.Loader
+	var png := _png_bytes(40, 20)
+	var img: Image = L.decode_image(png, 1024)
+	check(img != null and img.get_width() == 40 and img.get_height() == 20, "PNG 解碼尺寸正確")
+	var small: Image = L.decode_image(_png_bytes(400, 200), 100)
+	check(small != null and small.get_width() == 100 and small.get_height() == 50, "超過上限時等比縮小")
+	check(L.decode_image(PackedByteArray([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), 1024) == null, "亂碼解碼回傳 null")
+	check(L.decode_image("v 0 0 0".to_utf8_buffer(), 1024) == null, "非圖片內容回傳 null")
+	var ds: Vector2 = L.image_display_size(40, 20, 0.8)
+	check(near(ds.x, 0.8) and near(ds.y, 0.4), "圖片顯示尺寸：長邊 = 0.8")
+	check(near(L.fit_scale(AABB(Vector3.ZERO, Vector3(2, 4, 1)), 0.8), 0.2), "fit_scale：最長邊縮到 0.8")
+	check(near(L.fit_scale(AABB(), 0.8), 1.0), "fit_scale：空包圍盒不爆")
+
+	var obj: Dictionary = L.parse_obj(_OBJ_CUBE)
+	check(obj["ok"], "OBJ 立方體解析成功")
+	if obj["ok"]:
+		check(obj["triangles"] == 12, "OBJ：6 個四邊形 = 12 個三角形（實際 %d）" % obj["triangles"])
+		check(near_v3(obj["aabb"].size, Vector3(2, 2, 2)), "OBJ：包圍盒 2×2×2")
+	check(not L.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n")["ok"], "OBJ：索引越界被拒絕")
+	check(not L.parse_obj("v 0 0 0\n")["ok"], "OBJ：沒有面被拒絕")
+	var neg: Dictionary = L.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\n")
+	check(neg["ok"] and neg["triangles"] == 1, "OBJ：支援負索引")
+	var tex: Dictionary = L.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1/1 2/2/1 3/3/1\n")
+	check(tex["ok"], "OBJ：v/vt/vn 格式可解析")
+
+	var glb: Dictionary = L.load_glb(_glb_triangle_bytes())
+	check(glb["ok"], "GLB 三角形載入成功：%s" % str(glb.get("error", "")))
+	if glb["ok"]:
+		check(glb["triangles"] == 1, "GLB：1 個三角形")
+		check(near_v3(glb["aabb"].size, Vector3(2, 4, 0)), "GLB：包圍盒 2×4×0")
+		glb["root"].free()
+	check(not L.load_glb("glTF-壞掉的檔案-壞掉的檔案".to_utf8_buffer())["ok"], "壞 GLB 被拒絕且不崩潰")
+
+
+func test_memory_views() -> void:
+	print("[5b] 記憶節點外觀與互動碰撞體")
+	var m = SM.PalaceModel.new()
+	var a = m.create_cell("甲", "ivory", Vector3(8, 3, 5))
+	m.activate_cell(a.id)
+	var tmp := "user://mv_test_%d" % Time.get_ticks_usec()
+	var assets = ST.AssetStore.new(tmp)
+	var img_r: Dictionary = assets.import_bytes(_png_bytes(40, 20))
+	var obj_r: Dictionary = assets.import_bytes(_OBJ_CUBE.to_utf8_buffer(), "obj")
+	var glb_r: Dictionary = assets.import_bytes(_glb_triangle_bytes())
+	check(img_r["ok"] and obj_r["ok"] and glb_r["ok"], "測試素材匯入成功")
+
+	var n_blank = m.add_memory_node(a.id, "", "", Vector3(1, 1, 1))
+	var n_img = m.add_memory_node(a.id, img_r["hash"], "image", Vector3(2, 1, 1))
+	var n_obj = m.add_memory_node(a.id, obj_r["hash"], "model", Vector3(3, 1, 1))
+	var n_glb = m.add_memory_node(a.id, glb_r["hash"], "model", Vector3(4, 1, 1))
+	var n_miss = m.add_memory_node(a.id, "0".repeat(64), "image", Vector3(5, 1, 1))
+	var n_bad = m.add_memory_node(a.id, img_r["hash"], "model", Vector3(6, 1, 1))   # 型別與內容不符
+	n_img.set_prompt("單字：apple")
+	n_img.scale = Vector3(2, 2, 1)
+
+	var root := Node3D.new()
+	var views: Dictionary = MV.populate_cell(root, m, a.id, assets)
+	check(views.size() == 6, "房間內 6 個記憶節點都有外觀")
+	check(views[n_blank.id].status == "placeholder", "無素材：佔位符")
+	check(views[n_img.id].status == "ok", "圖片：ok")
+	check(views[n_obj.id].status == "ok", "OBJ：ok")
+	check(views[n_glb.id].status == "ok", "GLB：ok")
+	check(views[n_miss.id].status == "missing_asset", "素材遺失：紅框")
+	check(views[n_bad.id].status in ["decode_failed", "unsupported"], "型別不符：退回紅框（%s）" % views[n_bad.id].status)
+	var vi = views[n_img.id]
+	check(near(vi.content_size.x, 1.6) and near(vi.content_size.y, 0.8), "圖片 scale 2×2 → 內容 1.6×0.8")
+	check(near_v3(vi.position, Vector3(2, 1, 1)), "外觀位置 = 節點位置")
+	check(vi.label.text == "單字：apple", "提示文字顯示")
+	var vo = views[n_obj.id]
+	check(near(maxf(vo.content_size.x, maxf(vo.content_size.y, vo.content_size.z)), 0.8, 1e-3), "OBJ 最長邊縮到 0.8")
+	check(vo.hit_body.collision_layer == (1 << 22) and vo.hit_body.collision_mask == 0, "互動碰撞體在物理層 23")
+	check(vo.hit_body.get_meta("memory_node_id") == n_obj.id and vo.hit_body.get_meta("cell_id") == a.id, "互動碰撞體帶節點與房間 id")
+	var vis_ok := true
+	for v in views.values():
+		v.set_render_layer(a.render_layer)
+		for ch in v.get_children():
+			if ch is VisualInstance3D and ch.layers != SM.PalaceModel.layer_bit(a.render_layer):
+				vis_ok = false
+	check(vis_ok, "視覺層套用到所有可見子節點")
+	# 重建不留舊容器
+	var again: Dictionary = MV.populate_cell(root, m, a.id, assets)
+	await_free_holder(root)
+	check(again.size() == 6, "重建後仍是 6 個")
+	root.free()
+	ST.Io.remove_tree(tmp)
+
+
+func await_free_holder(root: Node3D) -> void:
+	var count := 0
+	for ch in root.get_children():
+		if ch.name.begins_with("Memories"):
+			count += 1
+	check(count <= 2, "重建時舊的 Memories 容器已移除（待釋放）")
+
+
+func test_player_logic() -> void:
+	print("[5c] 玩家控制：純邏輯")
+	var L = PC.Logic
+	check(L.joystick_vector(Vector2(100, 100), Vector2(105, 100), 110.0) == Vector2.ZERO, "搖桿死區內：不動")
+	var full: Vector2 = L.joystick_vector(Vector2(100, 100), Vector2(100, -200), 110.0)
+	check(near(full.length(), 1.0) and full.y < 0.0, "搖桿往上推到底：長度 1、y 為負（前進）")
+	var half: Vector2 = L.joystick_vector(Vector2.ZERO, Vector2(55, 0), 110.0)
+	check(half.x > 0.0 and half.x < 0.6, "搖桿半推：介於 0~0.6")
+	check(L.joystick_vector(Vector2.ZERO, Vector2(50, 0), 0.0) == Vector2.ZERO, "半徑 0 不爆")
+
+	var fwd: Vector3 = L.wish_velocity(Vector2(0, -1), 0.0, 3.0)
+	check(near_v3(fwd, Vector3(0, 0, -3)), "yaw=0 往前 = −Z")
+	var right: Vector3 = L.wish_velocity(Vector2(1, 0), -PI / 2.0, 3.0)
+	check(near_v3(right, Vector3(0, 0, 3)), "朝 +X（yaw=−90°）時往右 = +Z")
+	var diag: Vector3 = L.wish_velocity(Vector2(1, -1), 0.0, 3.0)
+	check(near(diag.length(), 3.0), "斜向速度不超過上限")
+
+	for yaw in [0.0, 0.7, -2.1, PI / 2.0, -PI / 2.0]:
+		check(near(L.yaw_of(Basis.from_euler(Vector3(0, yaw, 0))), yaw, 1e-4), "yaw_of 與 from_euler 互逆（%.2f）" % yaw)
+	check(near(L.clamp_pitch(5.0), deg_to_rad(85.0)) and near(L.clamp_pitch(-5.0), -deg_to_rad(85.0)), "俯仰角限制 ±85°")
+	check(L.is_tap(0.1, 5.0) and not L.is_tap(0.5, 5.0) and not L.is_tap(0.1, 40.0), "點擊判定：短且幾乎沒動")
+
+	var set_up: Array = _two_cell_model()
+	var m = set_up[0]
+	var pa = set_up[3]
+	var pb = set_up[4]
+	var mat: Transform3D = m.teleport_matrix(pa.id)
+	var t: Dictionary = L.teleported(Vector3(8.0, 0.0, 2.5), -PI / 2.0, mat)
+	check(near_v3(t["pos"], Vector3(3, 0, 0)), "穿門：位置落在出口門的平面上（%s）" % str(t["pos"]))
+	var out_fwd := -Basis.from_euler(Vector3(0, t["yaw"], 0)).z
+	check(near_v3(out_fwd, pb.normal), "穿門：朝向變成出口門的法線方向（走進房間）")
+	# 往回傳送再轉回來 = 原樣
+	var back: Transform3D = m.teleport_matrix(pb.id)
+	var t2: Dictionary = L.teleported(t["pos"], t["yaw"], back)
+	check(near_v3(t2["pos"], Vector3(8, 0, 2.5)) and near(L.yaw_of(Basis.from_euler(Vector3(0, t2["yaw"], 0))), -PI / 2.0, 1e-3), "來回傳送恢復原位與朝向")
+
+	check(L.out_of_bounds(Vector3(4, -7, 2), Vector3(8, 3, 5)), "掉到太低：視為出界")
+	check(not L.out_of_bounds(Vector3(4, -1.5, 2), Vector3(8, 3, 5)), "穿過地板門下墜的過程不算出界")
+	check(L.inside_cell(Vector3(4, 0, 2), Vector3(8, 3, 5)) and not L.inside_cell(Vector3(9, 0, 2), Vector3(8, 3, 5)), "inside_cell")
+
+
+## 真的跑物理：站上地板、走路、穿過傳送門、點選記憶節點
+func test_player_physics() -> void:
+	print("[5d] 玩家控制：物理走路 + 穿過傳送門 + 點選")
+	await process_frame    # 等 SceneTree 真正啟動，節點才算在樹內
+	var m = SM.PalaceModel.new()
+	var a = m.create_cell("甲", "ivory", Vector3(8, 3, 5))
+	var b = m.create_cell("乙", "night", Vector3(6, 3, 9))
+	var pa = _place(m, a.id, 1, Vector3(8, 1.1, 2.5), Vector2(1.2, 2.2), true)
+	var pb = _place(m, b.id, 2, Vector3(3, 1.1, 0), Vector2(1.2, 2.2), true)
+	m.link_portals(pa.id, pb.id, true)
+	m.activate_cell(a.id)
+	m.activate_cell(b.id)
+	var mem = m.add_memory_node(a.id, "", "", Vector3(4, 1.6, 2.5))
+	var far_mem = m.add_memory_node(b.id, "", "", Vector3(4, 1.6, 2.5))   # 別間房、同座標：不可被點到
+
+	var scene := Node3D.new()
+	root.add_child(scene)
+	var cells := {}
+	for c in [a, b]:
+		var node = RB.build_cell(m, c.id)
+		scene.add_child(node)
+		MV.populate_cell(node, m, c.id, null)
+		cells[c.id] = node
+	var ps = PS.new()
+	scene.add_child(ps)
+	var player = PC.new()
+	scene.add_child(player)
+	player.setup(m, ps)
+	player.place_in_cell(a.id, Vector3(2, 0.5, 2.5), -PI / 2.0)
+
+	for i in range(40):
+		await physics_frame
+	check(player.is_on_floor(), "玩家落地站穩")
+	check(absf(player.global_position.y) < 0.05, "站在地板上（y=%.3f）" % player.global_position.y)
+	check(player.current_cell_id == a.id, "目前房間是甲")
+
+	# 點選：朝 +X 看，記憶節點在正前方 2m
+	player.camera.force_update_transform()
+	var vp_center: Vector2 = player.get_viewport().get_visible_rect().size * 0.5
+	var picked: String = player.pick_node(vp_center)
+	check(picked == mem.id, "正前方射線點到甲房的記憶節點（得到 %s）" % picked)
+	check(picked != far_mem.id, "不會點到乙房同座標的節點")
+	var surf: Dictionary = player.raycast_surface(vp_center + Vector2(0, 500))
+	check(not surf.is_empty() and surf["normal"].y > 0.9, "往下的射線打到地板（法線朝上）")
+	check(player.pick_node(vp_center + Vector2(0, 500)) == "", "點地板：沒有節點")
+
+	# 往 +X 走，穿過傳送門
+	var entered := []
+	player.cell_entered.connect(func(cid, pid): entered.append([cid, pid]))
+	player.move_input = Vector2(0, -1)
+	var start_x: float = player.global_position.x
+	for i in range(30):
+		await physics_frame
+	check(player.global_position.x > start_x + 1.0 or player.current_cell_id != a.id, "往前推搖桿，玩家會移動")
+	for i in range(240):
+		await physics_frame
+		if player.current_cell_id != a.id:
+			break
+	check(player.current_cell_id == b.id, "走進傳送門後目前房間變成乙")
+	check(entered.size() == 1 and entered[0][0] == b.id and entered[0][1] == pa.id, "cell_entered 訊號：進入乙、經過甲的門")
+	check(ps.current_cell_id == b.id, "傳送門系統同步切到乙")
+	check(player.collision_mask == SM.PalaceModel.layer_bit(b.physics_layer), "碰撞遮罩換成乙房的物理層")
+	player.move_input = Vector2.ZERO
+	for i in range(60):
+		await physics_frame
+	check(player.is_on_floor() and absf(player.global_position.y) < 0.05, "傳送後站在乙房地板上（y=%.3f）" % player.global_position.y)
+	var p: Vector3 = player.global_position
+	check(p.x > 0.0 and p.x < 6.0 and p.z > 0.0 and p.z < 9.0, "傳送後仍在乙房範圍內（%s）" % str(p))
+	var f: Vector3 = -Basis.from_euler(Vector3(0, player.get_yaw(), 0)).z
+	check(f.dot(pb.normal) > 0.9, "傳送後朝向房內（沒有面向牆）")
+
+	# 掉出世界會被拉回
+	var resp := [0]
+	player.respawned.connect(func(): resp[0] += 1)
+	player.global_position = Vector3(3, -20, 3)
+	await physics_frame
+	await physics_frame
+	check(resp[0] >= 1 and player.global_position.y > -1.0, "掉出世界：送回最後安全位置")
+
+	scene.queue_free()
+	await process_frame
+
+
+# ------------------------------------------------------------------ (1e) 刪除：記憶物件 / 門 / 房間
+
+func test_deletions() -> void:
+	print("[1e] 刪除記憶物件 / 門 / 房間")
+	var set_up: Array = _two_cell_model()
+	var m = set_up[0]
+	var a = set_up[1]
+	var b = set_up[2]
+	var pa = set_up[3]
+	var pb = set_up[4]
+	var n1 = m.add_memory_node(a.id, "", "", Vector3(1, 1, 1))
+	check(m.remove_memory_node(n1.id) and not m.memory_nodes.has(n1.id), "刪除記憶物件")
+	check(not m.remove_memory_node(n1.id), "重複刪除回傳 false")
+	check(m.remove_cell(a.id).get("error", "") == "cell_has_links", "房間仍有配對的門：拒絕刪除")
+	check(m.delete_portal(pa.id), "刪除門")
+	check(not m.portals.has(pa.id) and not a.portals.has(pa.id), "門從資料與房間清單移除")
+	check(m.portals[pb.id].target_portal_id == "" and not m.portals[pb.id].is_bidirectional, "對側的門自動解除配對")
+	check(m.validate().is_empty(), "刪門後資料仍完整")
+	m.add_memory_node(a.id, "", "", Vector3(2, 1, 2))
+	m.add_ramp(a.id, Vector3(1, 0, 1), Vector3.RIGHT, 1.0, 2.0, 1.0)
+	m.activate_cell(a.id)
+	check(m.remove_cell(a.id).get("ok", false), "解除配對後可刪房間")
+	check(not m.cells.has(a.id) and m.memory_nodes.is_empty() and m.structures.is_empty(), "房間的記憶物件與建材一併移除")
+	check(m.validate().is_empty(), "刪房後資料仍完整")
+	check(m.activate_cell(b.id).get("ok", false), "刪房後層位槽位可正常使用")
+
+
+## 斜坡 + 天花板開口 → 上樓；地板開口 → 下樓（掉進下方房間）
+func test_player_stairs() -> void:
+	print("[5e] 玩家控制：斜坡上樓（天花板門 → 地板門）與跳下樓")
+	await process_frame
+	var m = SM.PalaceModel.new()
+	var a = m.create_cell("一樓", "ivory", Vector3(6, 3, 6))
+	var b = m.create_cell("二樓", "night", Vector3(6, 3, 6))
+	m.add_ramp(a.id, Vector3(0.8, 0, 3), Vector3.RIGHT, 1.0, 4.0, 2.8)
+	var up_a = _place(m, a.id, 5, Vector3(2.7, 3, 3))          # 一樓天花板開口（預設 1m×1m）
+	var up_b = _place(m, b.id, 4, Vector3(3, 0, 3))            # 二樓地板開口
+	check(m.link_portals(up_a.id, up_b.id, true)["ok"], "天花板門 ↔ 地板門配對")
+	m.activate_cell(a.id)
+	m.activate_cell(b.id)
+	var scene := Node3D.new()
+	root.add_child(scene)
+	for c in [a, b]:
+		scene.add_child(RB.build_cell(m, c.id))
+	var ps = PS.new()
+	scene.add_child(ps)
+	var player = PC.new()
+	scene.add_child(player)
+	player.setup(m, ps)
+	player.place_in_cell(a.id, Vector3(0.4, 0.05, 3), -PI / 2.0)
+	for i in range(30):
+		await physics_frame
+	check(player.is_on_floor(), "起點站穩")
+	player.move_input = Vector2(0, -1)
+	var guard := 0
+	while player.current_cell_id == a.id and guard < 500:
+		await physics_frame
+		guard += 1
+	var climbed: bool = player.current_cell_id == b.id
+	check(climbed, "沿斜坡走上去，穿過天花板門進入二樓（走了 %d 幀，位置 %s）" % [guard, str(player.global_position)])
+	player.move_input = Vector2.ZERO
+	for i in range(90):
+		await physics_frame
+	if climbed:
+		check(player.current_cell_id == b.id, "沒有被彈回一樓（不會在門口來回震盪）")
+		check(player.is_on_floor() and absf(player.global_position.y) < 0.05, "站在二樓地板上（y=%.3f）" % player.global_position.y)
+		var p: Vector3 = player.global_position
+		check(p.x > 3.5 and p.x < 5.9 and absf(p.z - 3.0) < 0.6, "被推到門洞外的實心地板上（%s）" % str(p))
+
+		# 往回：跳下二樓地板門，回到一樓天花板下方自由落下
+		var down := [0]
+		player.cell_entered.connect(func(cid, _pid): down[0] += 1 if cid == a.id else 0)
+		player.place_in_cell(b.id, Vector3(3, 0.05, 3), 0.0)   # 站在洞上方（洞沒有碰撞）
+		for i in range(240):
+			await physics_frame
+			if player.current_cell_id == a.id:
+				break
+		check(player.current_cell_id == a.id and down[0] == 1, "從地板門掉下去，回到一樓")
+		for i in range(120):
+			await physics_frame
+		check(player.is_on_floor() and player.global_position.y < 2.9, "落回一樓斜坡（洞正下方就是斜坡）（y=%.2f）" % player.global_position.y)
+	scene.queue_free()
+	await process_frame
+
+
+# ------------------------------------------------------------------ (6) 主場景整合：開門 / 樓梯 / 擴建 / 存檔重讀
+
+func test_main_scene() -> void:
+	print("[6] 主場景整合（用 main.tscn 實際操作）")
+	ST.Io.remove_tree("user://palace")
+	await process_frame
+	var main = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	await process_frame
+	for i in range(40):
+		await physics_frame
+	check(main.model.cells.size() == 1 and main.player.is_on_floor(), "全新啟動：一間入口大廳、玩家站穩")
+	check(main.model.memory_nodes.size() == 1 and main.memory_views.size() == 1, "附一個示範記憶方塊")
+	check(main.hud != null and main.hud._panels.size() >= 7, "介面面板都建立了")
+
+	main._on_add_requested("blank")
+	check(main.model.memory_nodes.size() == 2, "＋ 新增空白方塊並開啟編輯")
+	main.hud.handle_back()      # 取消編輯 → 新方塊被移除
+	check(main.model.memory_nodes.size() == 1, "取消編輯：新方塊被移除")
+
+	main.player.place_in_cell(main.player.current_cell_id, Vector3(4, 0.05, 4), -PI / 2.0)
+	for i in range(5):
+		await physics_frame
+	main._door_front()
+	check(main.model.cells.size() == 2 and main.model.portals.size() == 2, "前方開門：新房間 + 一對門")
+	check(main.model.validate().is_empty(), "開門後資料完整")
+
+	# 蓋樓梯，再實際走上去
+	main.player.place_in_cell("cell_0001", Vector3(4, 0.05, 6.5), 0.0)
+	for i in range(5):
+		await physics_frame
+	main._stairs_up()
+	check(main.model.cells.size() == 3 and main.model.structures.size() == 1, "蓋樓梯：新房間 + 斜坡")
+	var before: String = main.player.current_cell_id
+	var ids: Array = main.model.cells.keys()
+	ids.sort()
+	var up_id: String = ids[ids.size() - 1]
+	main.player.move_input = Vector2(0, -1)
+	var guard := 0
+	while main.player.current_cell_id == before and guard < 600:
+		await physics_frame
+		guard += 1
+	main.player.move_input = Vector2.ZERO
+	check(main.player.current_cell_id == up_id, "沿著自動蓋的樓梯走上去，抵達新房間（%d 幀，目前 %s）" % [guard, main.player.current_cell_id])
+	for i in range(90):
+		await physics_frame
+	check(main.player.is_on_floor() and absf(main.player.global_position.y) < 0.05, "在新房間站穩")
+	check(main.cell_nodes.has("cell_0001") and main.cell_nodes.has(up_id), "兩端房間節點都保持載入")
+
+	# 擴建
+	main._goto_room("cell_0001")
+	var z_before: float = main.model.cells["cell_0001"].size.z
+	main.player.place_in_cell("cell_0001", Vector3(4, 0.05, 4), 0.0)
+	main._begin_stretch()
+	main._confirm_stretch(2.0)
+	check(near(main.model.cells["cell_0001"].size.z, z_before + 2.0), "擴建：沿前進方向拉開 2 公尺")
+	check(main.model.validate().is_empty(), "擴建後資料完整")
+
+	# 存檔 → 重新啟動 → 內容一致
+	check(main.save_now() == OK, "存檔成功")
+	var cell_count: int = main.model.cells.size()
+	var portal_count: int = main.model.portals.size()
+	main.queue_free()
+	await process_frame
+	var main2 = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main2)
+	await process_frame
+	await process_frame
+	check(main2.model.cells.size() == cell_count and main2.model.portals.size() == portal_count, "重新啟動後房間與門數量一致")
+	check(main2.player.current_cell_id == "cell_0001", "回到離開時的房間")
+	check(main2.save_now() == OK, "重讀後可再次存檔（A/B 輪替）")
+	main2.queue_free()
+	await process_frame
+	ST.Io.remove_tree("user://palace")
