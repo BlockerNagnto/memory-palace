@@ -679,6 +679,52 @@ class PalaceModel extends RefCounted:
 		memory_nodes[n.id] = n
 		return n
 
+	func remove_memory_node(node_id: String) -> bool:
+		return memory_nodes.erase(node_id)
+
+	## 刪除一扇門（同時解除配對、從所屬房間的清單移除）
+	func delete_portal(portal_id: String) -> bool:
+		var p: Portal = portals.get(portal_id)
+		if p == null:
+			return false
+		unlink_portal(portal_id)
+		# 別的門若單向指向它，也一併清掉，避免留下懸空目標
+		for oid in portals:
+			var o: Portal = portals[oid]
+			if o.target_portal_id == portal_id:
+				o.target_portal_id = ""
+				o.is_bidirectional = false
+		var c: Cell = cells.get(p.cell_id)
+		if c != null:
+			c.portals.erase(portal_id)
+		portals.erase(portal_id)
+		return true
+
+	## 刪除房間（連同其建材、記憶物件與未配對的門）。房間仍有已配對的門時拒絕，需先解除配對 / 刪門。
+	func remove_cell(cell_id: String) -> Dictionary:
+		var c: Cell = cells.get(cell_id)
+		if c == null:
+			return _fail("cell_not_found")
+		for pid in c.portals:
+			var p: Portal = portals.get(pid)
+			if p == null:
+				continue
+			if p.target_portal_id != "":
+				return _fail("cell_has_links")
+			for oid in portals:
+				if portals[oid].target_portal_id == pid:
+					return _fail("cell_has_links")
+		for pid in c.portals.duplicate():
+			portals.erase(pid)
+		for sid in c.structures.duplicate():
+			structures.erase(sid)
+		for nid in memory_nodes.keys():
+			if memory_nodes[nid].cell_id == cell_id:
+				memory_nodes.erase(nid)
+		release_cell(cell_id)
+		cells.erase(cell_id)
+		return {"ok": true}
+
 	# ---------------------------------------------------------------- 傳送門：放置 / 縮放 / 平移
 
 	func _plane_rects(c: Cell, wall_index: int, exclude_id: String) -> Array:
