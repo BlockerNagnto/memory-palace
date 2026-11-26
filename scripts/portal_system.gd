@@ -178,12 +178,25 @@ class PortalView extends RefCounted:
 	var viewport: SubViewport
 	var camera: Camera3D
 	var active := false
+	var frozen := false      # 畫面沒變：停止更新、保留最後一張貼圖（省電、降溫）
 
 	func set_active(on: bool) -> void:
 		if on == active:
 			return
 		active = on
-		viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if on else SubViewport.UPDATE_DISABLED
+		if not on:
+			frozen = false
+		_apply_mode()
+
+	func set_frozen(on: bool) -> void:
+		if on == frozen:
+			return
+		frozen = on
+		_apply_mode()
+
+	func _apply_mode() -> void:
+		var live := active and not frozen
+		viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if live else SubViewport.UPDATE_DISABLED
 
 
 ## ====================================================================== 節點本體
@@ -197,6 +210,10 @@ var _l0: Dictionary = {}            # portal_id -> Surface（目前房間）
 var _clones: Dictionary = {}        # "slot|portal_id" -> Surface（深度 2 複本）
 var _views: Array = []              # PortalView 物件池（依規劃索引使用）
 var _view_size := Vector2i(64, 64)
+var _last_cam_xf := Transform3D()
+var _last_sig := ""
+var _still_frames := 0
+const STILL_FRAMES_TO_FREEZE := 3
 
 
 func _ready() -> void:
@@ -222,7 +239,13 @@ func refresh() -> void:
 	rebuild_surfaces()
 
 
+## 通知「畫面內容可能變了」（改了房間、記憶節點等）：下一幀起重新渲染傳送門視圖
+func request_update() -> void:
+	_still_frames = 0
+
+
 func rebuild_surfaces() -> void:
+	_still_frames = 0
 	for s in _l0.values():
 		s.queue_free()
 	_l0.clear()
@@ -261,6 +284,28 @@ func _process(_delta: float) -> void:
 	var budget := mini(max_visible, Logic.MAX_CLONE_SLOTS)
 	var plan := Logic.plan_views(model, current_cell_id, main_camera.global_transform, main_camera.fov, aspect, budget)
 	_apply_plan(plan, main_camera.global_position)
+	_update_freeze(plan, vp)
+
+
+## 攝影機沒動、視圖規劃也沒變，連續幾幀之後就讓所有視圖停止更新（保留最後一張貼圖）
+func _update_freeze(plan: Array, vp: Vector2) -> void:
+	var sig := "%s|%d|%d" % [str(vp), max_visible, plan.size()]
+	for spec in plan:
+		sig += "|%s:%d" % [spec["portal_id"], spec["depth"]]
+	var xf := main_camera.global_transform
+	if sig != _last_sig or not xf.is_equal_approx(_last_cam_xf):
+		_still_frames = 0
+	else:
+		_still_frames += 1
+	_last_sig = sig
+	_last_cam_xf = xf
+	var freeze := _still_frames >= STILL_FRAMES_TO_FREEZE
+	for v: PortalView in _views:
+		v.set_frozen(freeze)
+
+
+func is_frozen() -> bool:
+	return _still_frames >= STILL_FRAMES_TO_FREEZE
 
 
 func _ensure_view_size(vp: Vector2) -> void:
@@ -268,6 +313,7 @@ func _ensure_view_size(vp: Vector2) -> void:
 	if s == _view_size:
 		return
 	_view_size = s
+	_still_frames = 0
 	for v: PortalView in _views:
 		v.viewport.size = s
 

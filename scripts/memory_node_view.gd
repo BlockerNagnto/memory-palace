@@ -17,6 +17,7 @@ extends Node3D
 const SM = preload("res://scripts/space_model.gd")
 const RB = preload("res://scripts/room_builder.gd")
 const ST = preload("res://scripts/storage.gd")
+const FS = preload("res://scripts/font_setup.gd")
 
 const TARGET_SIZE := 0.8            # 長邊（公尺）；再乘上 MemoryNode.scale
 const PLACEHOLDER_SIZE := 0.4
@@ -386,6 +387,9 @@ func _build_label(text: String) -> void:
 	label = Label3D.new()
 	label.name = "Prompt"
 	label.text = text
+	var cjk: Font = FS.load_cjk()
+	if cjk != null:
+		label.font = cjk
 	label.font_size = 40
 	label.pixel_size = 0.004
 	label.outline_size = 10

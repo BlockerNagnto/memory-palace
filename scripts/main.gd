@@ -19,6 +19,7 @@ const MV = preload("res://scripts/memory_node_view.gd")
 const PS = preload("res://scripts/portal_system.gd")
 const PC = preload("res://scripts/player_controller.gd")
 const HUD = preload("res://scripts/ui_hud.gd")
+const FS = preload("res://scripts/font_setup.gd")
 
 const APP_ROOT := "user://palace"
 const THEME_ORDER := ["default", "ivory", "night", "forest", "ocean", "rose"]
@@ -37,7 +38,8 @@ const ERROR_TEXT := {
 	"plane_not_empty": "這個位置不能放門",
 	"full_wall": "這面牆放不下門",
 	"orientation_mismatch": "門的方向不相容",
-	"horizontal_needs_floor_and_ceiling": "上下樓的門必須是「地板 ↔ 天花板」",
+	"horizontal_needs_floor_and_ceiling": "上下樓的門必須是「地板」配「天花板」",
+	"no_room_for_resize": "已到上限：碰到牆角或別的門了",
 }
 
 var model = null
@@ -63,6 +65,7 @@ var _pending_import_kind := ""
 func _ready() -> void:
 	get_tree().set_auto_accept_quit(false)
 	DisplayServer.screen_set_keep_on(true)
+	var font_ok: bool = FS.install()      # 先裝好中文字型，介面才不會變豆腐塊
 	_setup_environment()
 	_open_stores()
 
@@ -84,10 +87,12 @@ func _ready() -> void:
 	var loaded := _load_world()
 	_apply_settings()
 	_start_world(loaded["session"])
-	if loaded["message"] != "":
+	if not font_ok and OS.get_name() == "Android":
+		hud.toast("找不到系統中文字型，文字可能顯示成方框（%s）" % FS.status, 8.0)
+	elif loaded["message"] != "":
 		hud.toast(loaded["message"], 5.0)
 	elif loaded["fresh"]:
-		hud.toast("歡迎！左手搖桿移動、右手滑動看四周，點金色方塊看記憶，點 ☰ 蓋房間。", 7.0)
+		hud.toast("歡迎！左手搖桿移動、右手滑動看四周，點金色方塊看記憶，點「選單」蓋房間。", 7.0)
 
 
 # ====================================================================== 初始化
@@ -102,7 +107,7 @@ func _setup_environment() -> void:
 	we.name = "WorldEnvironment"
 	we.environment = env
 	add_child(we)
-	get_viewport().msaa_3d = Viewport.MSAA_2X
+	get_viewport().msaa_3d = Viewport.MSAA_DISABLED      # 省電；畫質靠設定裡的解析度比例
 
 
 func _open_stores() -> void:
@@ -114,7 +119,6 @@ func _open_stores() -> void:
 
 
 func _connect_signals() -> void:
-	hud.jump_pressed.connect(func(): player.jump())
 	hud.modal_changed.connect(func(open: bool): player.set_enabled(not open))
 	hud.add_requested.connect(_on_add_requested)
 	hud.door_requested.connect(_on_door_requested)
@@ -135,6 +139,10 @@ func _connect_signals() -> void:
 	hud.settings_changed.connect(_on_settings_changed)
 	hud.backup_export_requested.connect(_backup_export)
 	hud.backup_import_requested.connect(_backup_import)
+	hud.edit_target_requested.connect(_on_edit_target_requested)
+	hud.build_requested.connect(_on_build_requested)
+	hud.edit_action.connect(_on_edit_action)
+	hud.editor_closed.connect(_close_target)
 	player.node_picked.connect(_on_node_picked)
 	player.cell_entered.connect(_on_cell_entered)
 	player.respawned.connect(func(): hud.toast("掉出房間了，已送回上一個安全位置"))
@@ -774,6 +782,12 @@ func _end_stretch() -> void:
 # ====================================================================== 設定
 
 func _apply_settings() -> void:
+	var real_display := DisplayServer.get_name() != "headless"
+	Engine.max_fps = int(settings.get_value("max_fps")) if real_display else 0
+	if real_display:
+		OS.low_processor_usage_mode = true            # 畫面沒變就不重畫，靜止時幾乎不耗電
+		OS.low_processor_usage_mode_sleep_usec = 6900
+	get_viewport().scaling_3d_scale = float(settings.get_value("render_scale"))
 	player.look_sensitivity = BASE_LOOK_SENS * float(settings.get_value("look_sensitivity"))
 	player.swap_sides = bool(settings.get_value("mirror_ui"))
 	portal_system.max_visible = int(settings.get_value("max_visible_portals"))
@@ -952,3 +966,401 @@ func _replace_world(new_model, session: Dictionary) -> void:
 	model = new_model
 	_apply_settings()
 	_start_world(session)
+
+
+# ====================================================================== 放置平台 / 欄桿
+
+func _anchor_point() -> Vector3:
+	var vp := get_viewport().get_visible_rect().size
+	var hit: Dictionary = player.raycast_surface(vp * 0.5)
+	if hit.is_empty():
+		var far: Vector3 = player.eye_position() + _facing_dir() * 2.0
+		far.y = 0.0
+		return far
+	var pos: Vector3 = hit["position"]
+	var n: Vector3 = hit["normal"]
+	if n.y > 0.7:
+		return pos                                   # 地板或平台頂面：就放在那裡
+	return Vector3(pos.x + n.x, 0.0, pos.z + n.z)    # 打到牆：放在牆前 1 公尺的地面
+
+
+func _on_build_requested(kind: String) -> void:
+	var cell = model.cells[player.current_cell_id]
+	var a := _anchor_point()
+	var s = null
+	if kind == "platform":
+		s = model.add_platform(cell.id, Vector3(a.x - 1.0, maxf(a.y, 0.0) + 0.3, a.z - 1.0), Vector2(2.0, 2.0), 0.3)
+		model.move_structure(s.id, s.pos)
+	elif kind == "railing":
+		s = model.add_railing(cell.id, a, _facing_dir(), 2.0, 1.0)
+		model.move_structure(s.id, s.pos)
+	if s == null:
+		return
+	_rebuild_cell(cell.id)
+	_mark_dirty()
+	_open_target("structure", s.id)
+
+
+# ====================================================================== 編輯門與建材
+
+var _target: Dictionary = {}         # {kind, id, box}
+
+
+func _structure_id_of(collider: Object) -> String:
+	var n: Node = collider as Node
+	while n != null:
+		if n.has_meta("structure_id"):
+			return str(n.get_meta("structure_id"))
+		n = n.get_parent()
+	return ""
+
+
+## 準心對準的門或建材。回傳 {kind, id} 或 {}
+func _pick_target() -> Dictionary:
+	var cell = model.cells[player.current_cell_id]
+	var cam: Camera3D = player.camera
+	var c := get_viewport().get_visible_rect().size * 0.5
+	var from := cam.project_ray_origin(c)
+	var dir := cam.project_ray_normal(c)
+	var best_t := INF
+	var best_pid := ""
+	for pid in cell.portals:
+		var p = model.portals[pid]
+		var n: Vector3 = p.normal.normalized()
+		var denom := dir.dot(n)
+		if denom > -0.01:
+			continue
+		var t: float = (p.local_pos - from).dot(n) / denom
+		if t <= 0.0 or t > PC.PICK_DISTANCE or t >= best_t:
+			continue
+		if PS.Logic.inside_rect(p, from + dir * t, 0.15):
+			best_t = t
+			best_pid = pid
+	var hit: Dictionary = player.raycast_surface(c)
+	if not hit.is_empty():
+		var sid := _structure_id_of(hit["collider"])
+		if sid != "" and model.structures.has(sid) and (best_pid == "" or float(hit["distance"]) < best_t - 0.02):
+			return {"kind": "structure", "id": sid}
+	if best_pid != "":
+		return {"kind": "portal", "id": best_pid}
+	return {}
+
+
+func _on_edit_target_requested() -> void:
+	if hud.is_panel_open():
+		return
+	var t := _pick_target()
+	if t.is_empty():
+		hud.toast("請把準心對準一扇門，或一個平台 / 欄桿 / 斜坡，再按「編輯」", 4.0)
+		return
+	_open_target(str(t["kind"]), str(t["id"]))
+
+
+func _open_target(kind: String, id: String) -> void:
+	_close_target_box()
+	_target = {"kind": kind, "id": id, "box": null}
+	_refresh_target()
+
+
+func _close_target() -> void:
+	_close_target_box()
+	_target = {}
+
+
+func _close_target_box() -> void:
+	var b = _target.get("box")
+	if b != null and is_instance_valid(b):
+		b.queue_free()
+	if not _target.is_empty():
+		_target["box"] = null
+
+
+func _target_exists() -> bool:
+	if _target.is_empty():
+		return false
+	return model.portals.has(_target["id"]) if _target["kind"] == "portal" else model.structures.has(_target["id"])
+
+
+func _structure_aabb(s) -> AABB:
+	if s.kind == "platform":
+		return AABB(Vector3(s.pos.x, s.pos.y - s.thickness, s.pos.z), Vector3(s.size.x, s.thickness, s.size.y))
+	if s.kind == "railing":
+		var a: Vector3 = s.pos
+		var b: Vector3 = s.end_pos()
+		var lo := Vector3(minf(a.x, b.x), a.y, minf(a.z, b.z))
+		var hi := Vector3(maxf(a.x, b.x), a.y + s.height, maxf(a.z, b.z))
+		return AABB(lo, hi - lo)
+	var pts: PackedVector3Array = s.convex_points()
+	var bb := AABB(pts[0], Vector3.ZERO)
+	for q in pts:
+		bb = bb.expand(q)
+	return bb
+
+
+func _portal_aabb(p) -> AABB:
+	var cell = model.cells[p.cell_id]
+	var rect := SM.PalaceModel.portal_rect(p)
+	var a := SM.PalaceModel.plane_point(cell.size, p.wall_index, rect.position.x, rect.position.y)
+	var b := SM.PalaceModel.plane_point(cell.size, p.wall_index, rect.end.x, rect.end.y)
+	var lo := Vector3(minf(a.x, b.x), minf(a.y, b.y), minf(a.z, b.z))
+	var hi := Vector3(maxf(a.x, b.x), maxf(a.y, b.y), maxf(a.z, b.z))
+	return AABB(lo, hi - lo).grow(0.05)
+
+
+func _show_target_box() -> void:
+	_close_target_box()
+	if not _target_exists():
+		return
+	var cid: String
+	var box: AABB
+	if _target["kind"] == "portal":
+		var p = model.portals[_target["id"]]
+		cid = p.cell_id
+		box = _portal_aabb(p)
+	else:
+		var s = model.structures[_target["id"]]
+		cid = s.cell_id
+		box = _structure_aabb(s).grow(0.04)
+	var node: Node3D = cell_nodes.get(cid)
+	if node == null:
+		return
+	var mi: MeshInstance3D = RB.make_wire_box(box.size, Color(0.4, 0.85, 1.0))
+	mi.position = box.get_center()
+	node.add_child(mi)
+	RB.apply_layers(mi, model.cells[cid].render_layer, 0)
+	_target["box"] = mi
+
+
+## 依目前選取的門 / 建材重畫編輯面板與外框
+func _refresh_target() -> void:
+	if not _target_exists():
+		_close_target()
+		hud.close_panel()
+		return
+	_show_target_box()
+	if _target["kind"] == "portal":
+		_show_portal_panel(model.portals[_target["id"]])
+	else:
+		_show_structure_panel(model.structures[_target["id"]])
+
+
+func _show_portal_panel(p) -> void:
+	var horiz: bool = p.is_horizontal()
+	var wlab := "寬"
+	var hlab := "長" if horiz else "高"
+	var linked := "已連通" if p.target_portal_id != "" else "尚未連通"
+	var kind_name := "地板開口" if p.wall_index == 4 else ("天花板開口" if p.wall_index == 5 else "牆上的門")
+	var info := "%s　%s %.1f × %s %.1f 公尺　（%s）\n從中心往兩側對稱縮放；碰到牆角或別的門就會停住。" % [kind_name, wlab, p.size.x, hlab, p.size.y, linked]
+	var rows: Array = [
+		[[wlab + " -", "pw-"], [wlab + " +", "pw+"], [hlab + " -", "ph-"], [hlab + " +", "ph+"]],
+	]
+	if horiz:
+		rows.append([["左移", "pm:left"], ["右移", "pm:right"], ["前移", "pm:forward"], ["後移", "pm:back"]])
+	else:
+		rows.append([["左移", "pm:left"], ["右移", "pm:right"], ["上移", "pm:up"], ["下移", "pm:down"]])
+	rows.append([["移到準心位置", "pcross"], ["刪除這扇門", "pdel"]])
+	hud.show_editor("編輯：%s" % kind_name, info, rows)
+
+
+func _show_structure_panel(s) -> void:
+	var rows: Array = []
+	var info := ""
+	var title := ""
+	if s.kind == "platform":
+		title = "編輯：平台"
+		info = "長寬 %.1f × %.1f 公尺，頂面高度 %.1f 公尺。\n低於 0.35 公尺的台階可以直接走上去；更高的需要斜坡。" % [s.size.x, s.size.y, s.pos.y]
+		rows = [
+			[["變窄", "ps:w-"], ["變寬", "ps:w+"], ["變短", "ps:l-"], ["變長", "ps:l+"]],
+			[["降低", "ph-"], ["升高", "ph+"]],
+		]
+	elif s.kind == "railing":
+		title = "編輯：欄桿"
+		info = "長度 %.1f 公尺，高 %.1f 公尺。" % [s.length, s.height]
+		rows = [[["縮短", "rl-"], ["加長", "rl+"], ["轉 90 度", "rrot"]]]
+	else:
+		title = "編輯：斜坡"
+		var slope: float = s.slope_angle_deg()
+		info = "長 %.1f、高 %.1f、寬 %.1f 公尺，坡度 %.0f 度。" % [s.length, s.height, s.width, slope]
+		if slope > 50.0:
+			info += "\n太陡了，走不上去，請加長或降低。"
+		rows = [
+			[["變短", "rp:l-"], ["變長", "rp:l+"], ["降低", "rp:h-"], ["升高", "rp:h+"]],
+			[["變窄", "rp:w-"], ["變寬", "rp:w+"], ["轉 90 度", "rrot"]],
+		]
+	rows.append([["移到準心位置", "scross"], ["刪除", "sdel"]])
+	hud.show_editor(title, info, rows)
+
+
+## 視角「右方」與「前方」（水平）
+func _view_right() -> Vector3:
+	return Basis.from_euler(Vector3(0.0, player.get_yaw(), 0.0)).x
+
+
+## 把任意水平向量吸附成 ±X 或 ±Z
+func _snap_axis(v: Vector3) -> Vector3:
+	if absf(v.x) >= absf(v.z):
+		return Vector3(signf(v.x), 0.0, 0.0)
+	return Vector3(0.0, 0.0, signf(v.z))
+
+
+## 以目前視角為準，哪一條世界軸算「寬」（左右方向）；回傳 "size_x" 或 "size_z"
+func _wide_op() -> String:
+	return "size_x" if absf(_view_right().x) >= absf(_view_right().z) else "size_z"
+
+
+func _narrow_op() -> String:
+	return "size_z" if _wide_op() == "size_x" else "size_x"
+
+
+func _on_edit_action(action: String) -> void:
+	if not _target_exists():
+		return
+	if _target["kind"] == "portal":
+		_portal_action(action)
+	else:
+		_structure_action(action)
+
+
+func _portal_action(action: String) -> void:
+	var p = model.portals[_target["id"]]
+	var cid: String = p.cell_id
+	var step := 0.2
+	var changed := false
+	match action:
+		"pw-", "pw+", "ph-", "ph+":
+			var d := -step if action.ends_with("-") else step
+			var want: Vector2 = p.size + (Vector2(d, 0.0) if action.begins_with("pw") else Vector2(0.0, d))
+			var before: Vector2 = p.size
+			var r: Dictionary = model.resize_portal(p.id, want)
+			if not r["ok"]:
+				hud.toast(_error_text(r))
+				return
+			changed = not p.size.is_equal_approx(before)
+			if not changed and d > 0.0:
+				hud.toast(ERROR_TEXT["no_room_for_resize"])
+		"pm:left", "pm:right", "pm:forward", "pm:back", "pm:up", "pm:down":
+			var dirv := Vector3.ZERO
+			match action:
+				"pm:left":
+					dirv = -_view_right()
+				"pm:right":
+					dirv = _view_right()
+				"pm:forward":
+					dirv = _facing_dir()
+				"pm:back":
+					dirv = -_facing_dir()
+				"pm:up":
+					dirv = Vector3.UP
+				"pm:down":
+					dirv = Vector3.DOWN
+			var n: Vector3 = p.normal.normalized()
+			dirv -= n * dirv.dot(n)                      # 只能沿門所在的平面移動
+			if absf(dirv.y) > maxf(absf(dirv.x), absf(dirv.z)):
+				dirv = Vector3(0.0, signf(dirv.y), 0.0)
+			else:
+				dirv = _snap_axis(dirv)
+			if dirv.length() < 0.5:
+				return
+			var before: Vector3 = p.local_pos
+			var r2: Dictionary = model.move_portal(p.id, p.local_pos + dirv * step)
+			if not r2["ok"]:
+				hud.toast(_error_text(r2))
+				return
+			changed = not p.local_pos.is_equal_approx(before)
+			if not changed:
+				hud.toast("再往那個方向就撞到牆角或別的門了")
+		"pcross":
+			var hit: Dictionary = player.raycast_surface(get_viewport().get_visible_rect().size * 0.5)
+			if hit.is_empty() or hit["normal"].dot(p.normal.normalized()) < 0.9:
+				hud.toast("請把準心對準「同一面牆（或同一個地板 / 天花板）」上要移動到的位置")
+				return
+			var r3: Dictionary = model.move_portal(p.id, hit["position"])
+			if not r3["ok"]:
+				hud.toast(_error_text(r3))
+				return
+			changed = true
+		"pdel":
+			var pid: String = p.id
+			hud.confirm("確定要刪除這扇門嗎？（對面的門會變成沒有連通）", func():
+				model.delete_portal(pid)
+				_close_target()
+				hud.close_panel()
+				_after_topology_change(cid, "已刪除門"))
+			return
+	if changed:
+		_rebuild_cell(cid)
+		portal_system.refresh()
+		_mark_dirty()
+	_refresh_target()
+
+
+func _structure_action(action: String) -> void:
+	var s = model.structures[_target["id"]]
+	var cid: String = s.cell_id
+	var r: Dictionary = {"ok": true, "changed": false}
+	match action:
+		"ps:w-":
+			r = model.adjust_structure(s.id, _wide_op(), -0.5)
+		"ps:w+":
+			r = model.adjust_structure(s.id, _wide_op(), 0.5)
+		"ps:l-":
+			r = model.adjust_structure(s.id, _narrow_op(), -0.5)
+		"ps:l+":
+			r = model.adjust_structure(s.id, _narrow_op(), 0.5)
+		"ph-":
+			r = model.adjust_structure(s.id, "height", -0.5)
+		"ph+":
+			r = model.adjust_structure(s.id, "height", 0.5)
+		"rl-":
+			r = model.adjust_structure(s.id, "length", -0.5)
+		"rl+":
+			r = model.adjust_structure(s.id, "length", 0.5)
+		"rp:l-":
+			r = model.adjust_structure(s.id, "length", -0.5)
+		"rp:l+":
+			r = model.adjust_structure(s.id, "length", 0.5)
+		"rp:h-":
+			r = model.adjust_structure(s.id, "height", -0.5)
+		"rp:h+":
+			r = model.adjust_structure(s.id, "height", 0.5)
+		"rp:w-":
+			r = model.adjust_structure(s.id, "width", -0.5)
+		"rp:w+":
+			r = model.adjust_structure(s.id, "width", 0.5)
+		"rrot":
+			r = model.adjust_structure(s.id, "rotate")
+		"scross":
+			var hit: Dictionary = player.raycast_surface(get_viewport().get_visible_rect().size * 0.5)
+			if hit.is_empty() or _structure_id_of(hit["collider"]) == s.id:
+				hud.toast("請把準心對準地面上要移動到的位置（不要對準它自己）")
+				return
+			var hp: Vector3 = hit["position"]
+			var np := hp
+			if s.kind == "platform":
+				np = Vector3(hp.x - s.size.x * 0.5, s.pos.y, hp.z - s.size.y * 0.5)
+			elif s.kind == "ramp":
+				np = Vector3(hp.x, 0.0, hp.z)
+			elif hit["normal"].y <= 0.7:
+				np = Vector3(hp.x, s.pos.y, hp.z)
+			r = model.move_structure(s.id, np)
+		"sdel":
+			var sid: String = s.id
+			var cell = model.cells[cid]
+			hud.confirm("確定要刪除這個建材嗎？", func():
+				model.structures.erase(sid)
+				cell.structures.erase(sid)
+				_close_target()
+				hud.close_panel()
+				_rebuild_cell(cid)
+				_mark_dirty()
+				hud.toast("已刪除"))
+			return
+	if not r.get("ok", false):
+		hud.toast("無法調整（%s）" % str(r.get("error", "?")))
+		return
+	if r.get("changed", false):
+		_rebuild_cell(cid)
+		_mark_dirty()
+	else:
+		hud.toast("已到上限（房間邊界或最小尺寸）")
+	_refresh_target()

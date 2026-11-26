@@ -26,6 +26,7 @@ const BODY_RADIUS := 0.3
 const BODY_HEIGHT := 1.75
 const PLAYER_LAYER_BIT := 1 << 20     # 物理層 21
 const INTERACT_BIT := 1 << 22         # 物理層 23
+const STEP_HEIGHT := 0.35            # 膝蓋高度：低於此高度的台階自動跨上去
 const PICK_DISTANCE := 8.0
 const MAX_PICK_STEPS := 8
 
@@ -138,7 +139,7 @@ func _ready() -> void:
 	collision_mask = 0
 	motion_mode = CharacterBody3D.MOTION_MODE_GROUNDED
 	floor_max_angle = deg_to_rad(55.0)
-	floor_snap_length = 0.35
+	floor_snap_length = STEP_HEIGHT + 0.05
 	floor_stop_on_slope = true
 	floor_constant_speed = true
 	max_slides = 6
@@ -373,7 +374,8 @@ func raycast_surface(screen_pos: Vector2) -> Dictionary:
 	var hit: Dictionary = get_world_3d().direct_space_state.intersect_ray(q)
 	if hit.is_empty():
 		return {}
-	return {"position": hit["position"], "normal": hit["normal"]}
+	return {"position": hit["position"], "normal": hit["normal"], "collider": hit["collider"],
+		"distance": from.distance_to(hit["position"])}
 
 
 # ---------------------------------------------------------------- 物理 / 穿門
@@ -412,6 +414,7 @@ func _physics_process(delta: float) -> void:
 	_jump_queued = false
 
 	var prev_eye := eye_position()
+	_try_step_up(delta)
 	move_and_slide()
 	var eye := eye_position()
 
@@ -430,6 +433,28 @@ func _physics_process(delta: float) -> void:
 		global_position = _last_safe
 		velocity = Vector3.ZERO
 		respawned.emit()
+
+
+## 自動跨階：水平前進被「低於膝蓋高度」的台階擋住時，先抬高再前進，之後由地面吸附貼回台階頂面。
+## 條件：站在地上、正在水平移動、抬高 STEP_HEIGHT 後頭上沒東西、抬高後前方沒東西。
+func _try_step_up(delta: float) -> void:
+	if not is_on_floor():
+		return
+	var motion := Vector3(velocity.x, 0.0, velocity.z) * delta
+	if motion.length() < 0.0005:
+		return
+	# 沿移動方向多看一點，避免「差一點碰到」才反應
+	var probe := motion.normalized() * maxf(motion.length(), 0.08)
+	var here := global_transform
+	if not test_move(here, probe):
+		return
+	if test_move(here, Vector3(0.0, STEP_HEIGHT, 0.0)):
+		return
+	var raised := here
+	raised.origin.y += STEP_HEIGHT
+	if test_move(raised, probe):
+		return
+	global_position.y += STEP_HEIGHT
 
 
 func _apply_teleport(r: Dictionary) -> void:

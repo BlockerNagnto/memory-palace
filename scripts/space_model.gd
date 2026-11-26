@@ -666,6 +666,109 @@ class PalaceModel extends RefCounted:
 		_register_structure(r, c)
 		return r
 
+	# ---------------------------------------------------------------- 建材調整（介面用）
+
+	const MIN_STRUCT_DIM := 0.5
+
+	## 沿延伸方向最多還能多長（pos 到房間邊界）
+	static func _max_along(c: Cell, s: Structure, dir: Vector3) -> float:
+		if absf(dir.x) > 0.5:
+			return (c.size.x - s.pos.x) if dir.x > 0.0 else s.pos.x
+		return (c.size.z - s.pos.z) if dir.z > 0.0 else s.pos.z
+
+	## 把建材夾回房間內（位置、尺寸）。回傳是否有任何改變。
+	func clamp_structure(s: Structure) -> bool:
+		var c: Cell = cells.get(s.cell_id)
+		if c == null:
+			return false
+		var before := s.to_dict()
+		if s is Platform:
+			var pl: Platform = s
+			pl.pos.x = clampf(pl.pos.x, 0.0, maxf(c.size.x - MIN_STRUCT_DIM, 0.0))
+			pl.pos.z = clampf(pl.pos.z, 0.0, maxf(c.size.z - MIN_STRUCT_DIM, 0.0))
+			pl.pos.y = clampf(pl.pos.y, pl.thickness, maxf(c.size.y - 0.3, pl.thickness))
+			pl.size.x = clampf(pl.size.x, MIN_STRUCT_DIM, c.size.x - pl.pos.x)
+			pl.size.y = clampf(pl.size.y, MIN_STRUCT_DIM, c.size.z - pl.pos.z)
+		elif s is Ramp:
+			var r: Ramp = s
+			r.pos.x = clampf(r.pos.x, 0.0, c.size.x)
+			r.pos.z = clampf(r.pos.z, 0.0, c.size.z)
+			r.pos.y = 0.0
+			var d := r.horizontal_dir()
+			r.length = clampf(r.length, MIN_STRUCT_DIM, maxf(_max_along(c, r, d), MIN_STRUCT_DIM))
+			r.height = clampf(r.height, 0.2, maxf(c.size.y - 0.2, 0.2))
+			var lat := r.pos.z if absf(d.x) > 0.5 else r.pos.x
+			var lat_len := c.size.z if absf(d.x) > 0.5 else c.size.x
+			var half_max := minf(lat, lat_len - lat)
+			r.width = clampf(r.width, MIN_STRUCT_DIM, maxf(half_max * 2.0, MIN_STRUCT_DIM))
+		elif s is Railing:
+			var rl: Railing = s
+			rl.pos.x = clampf(rl.pos.x, 0.0, c.size.x)
+			rl.pos.z = clampf(rl.pos.z, 0.0, c.size.z)
+			rl.pos.y = clampf(rl.pos.y, 0.0, maxf(c.size.y - 0.5, 0.0))
+			rl.length = clampf(rl.length, MIN_STRUCT_DIM, maxf(_max_along(c, rl, rl.horizontal_dir()), MIN_STRUCT_DIM))
+		return before != s.to_dict()
+
+	## 調整建材。op：
+	##   平台 size_x / size_z / height（amount = 公尺，可負）
+	##   斜坡 length / height / width；欄桿 length
+	##   斜坡、欄桿 rotate（繞起點順時針轉 90°，amount 忽略）
+	## 一律夾在房間範圍內。回傳 {ok, changed}；找不到 / 操作不適用 → {ok=false, error}
+	func adjust_structure(structure_id: String, op: String, amount: float = 0.0) -> Dictionary:
+		var s: Structure = structures.get(structure_id)
+		if s == null:
+			return _fail("structure_not_found")
+		var before := s.to_dict()
+		if s is Platform:
+			var pl: Platform = s
+			match op:
+				"size_x":
+					pl.size.x += amount
+				"size_z":
+					pl.size.y += amount
+				"height":
+					pl.pos.y += amount
+				_:
+					return _fail("bad_op")
+		elif s is Ramp:
+			var r: Ramp = s
+			match op:
+				"length":
+					r.length += amount
+				"height":
+					r.height += amount
+				"width":
+					r.width += amount
+				"rotate":
+					r.direction = _rotate_dir(r.horizontal_dir())
+				_:
+					return _fail("bad_op")
+		elif s is Railing:
+			var rl: Railing = s
+			match op:
+				"length":
+					rl.length += amount
+				"rotate":
+					rl.direction = _rotate_dir(rl.horizontal_dir())
+				_:
+					return _fail("bad_op")
+		clamp_structure(s)
+		return {"ok": true, "changed": before != s.to_dict()}
+
+	## +X → +Z → −X → −Z → +X（從上往下看是順時針）
+	static func _rotate_dir(d: Vector3) -> Vector3:
+		return Vector3(-d.z, 0.0, d.x)
+
+	## 移動建材到新位置（平台：x/z 為最小角、y 為頂面高度；斜坡 / 欄桿：起點）。夾在房間內。
+	func move_structure(structure_id: String, new_pos: Vector3) -> Dictionary:
+		var s: Structure = structures.get(structure_id)
+		if s == null:
+			return _fail("structure_not_found")
+		var before := s.to_dict()
+		s.pos = new_pos
+		clamp_structure(s)
+		return {"ok": true, "changed": before != s.to_dict()}
+
 	func add_memory_node(cell_id: String, asset_hash: String, asset_type: String, pos: Vector3) -> MemoryNode:
 		if not cells.has(cell_id):
 			return null

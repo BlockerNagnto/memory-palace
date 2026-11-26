@@ -9,6 +9,7 @@ const RB = preload("res://scripts/room_builder.gd")
 const PS = preload("res://scripts/portal_system.gd")
 const PC = preload("res://scripts/player_controller.gd")
 const MV = preload("res://scripts/memory_node_view.gd")
+const FS = preload("res://scripts/font_setup.gd")
 
 var _checks := 0
 var _failures := 0
@@ -39,6 +40,8 @@ func _run() -> void:
 	test_portal_placement()
 	test_layer_allocation()
 	test_deletions()
+	test_structure_adjust()
+	test_font_setup()
 	test_portal_matrix()
 	test_hashing_and_assets()
 	test_import_sources()
@@ -52,6 +55,7 @@ func _run() -> void:
 	test_player_logic()
 	await test_player_physics()
 	await test_player_stairs()
+	await test_player_step_up()
 	await test_main_scene()
 	print("checks=%d failures=%d" % [_checks, _failures])
 	var ok := _failures == 0
@@ -778,11 +782,17 @@ func test_settings() -> void:
 	print("[3d] 設定檔")
 	var root := "user://_headless_test_settings_%d" % Time.get_ticks_usec()
 	var st = ST.SettingsStore.new(root)
-	check(st.load_settings() == OK and int(st.get_value("max_visible_portals")) == 6, "預設門渲染上限為 6")
+	check(st.load_settings() == OK and int(st.get_value("max_visible_portals")) == 4, "預設門渲染上限為 4")
 	st.set_value("max_visible_portals", 99)
 	check(int(st.get_value("max_visible_portals")) == 12, "門渲染上限夾在 12 以內")
 	st.set_value("look_sensitivity", 0.0)
 	check(near(float(st.get_value("look_sensitivity")), 0.2), "靈敏度夾在 0.2 以上")
+	check(int(st.get_value("max_fps")) == 30 and near(float(st.get_value("render_scale")), 0.75), "預設 30 fps、畫質 0.75")
+	st.set_value("max_fps", 144)
+	st.set_value("render_scale", 0.9)
+	check(int(st.get_value("max_fps")) == 60 and near(float(st.get_value("render_scale")), 1.0), "fps 只能是 30 / 60；畫質吸附到 0.5 / 0.75 / 1.0")
+	st.set_value("max_fps", 30)
+	st.set_value("render_scale", 0.75)
 	st.set_value("mirror_ui", true)
 	st.set_value("unknown_key", 1)
 	check(not st.values.has("unknown_key"), "未知設定鍵被忽略")
@@ -793,7 +803,7 @@ func test_settings() -> void:
 	g.store_string("壞掉")
 	g.close()
 	var st3 = ST.SettingsStore.new(root)
-	check(st3.load_settings() == ERR_FILE_CORRUPT and int(st3.get_value("max_visible_portals")) == 6, "設定檔損毀時回到預設值")
+	check(st3.load_settings() == ERR_FILE_CORRUPT and int(st3.get_value("max_visible_portals")) == 4, "設定檔損毀時回到預設值")
 	ST.Io.remove_tree(root)
 
 
@@ -1282,7 +1292,7 @@ func test_main_scene() -> void:
 		await physics_frame
 	check(main.model.cells.size() == 1 and main.player.is_on_floor(), "全新啟動：一間入口大廳、玩家站穩")
 	check(main.model.memory_nodes.size() == 1 and main.memory_views.size() == 1, "附一個示範記憶方塊")
-	check(main.hud != null and main.hud._panels.size() >= 7, "介面面板都建立了")
+	check(main.hud != null and main.hud._panels.size() >= 8, "介面面板都建立了")
 
 	main._on_add_requested("blank")
 	check(main.model.memory_nodes.size() == 2, "＋ 新增空白方塊並開啟編輯")
@@ -1295,6 +1305,69 @@ func test_main_scene() -> void:
 	main._door_front()
 	check(main.model.cells.size() == 2 and main.model.portals.size() == 2, "前方開門：新房間 + 一對門")
 	check(main.model.validate().is_empty(), "開門後資料完整")
+	for i in range(12):
+		await physics_frame
+		await process_frame
+	check(main.portal_system.is_frozen(), "站著不動：傳送門視圖停止更新（省電）")
+	main.player.move_input = Vector2(0, 1)
+	for i in range(6):
+		await physics_frame
+		await process_frame
+	check(not main.portal_system.is_frozen(), "一移動就恢復更新")
+	main.player.move_input = Vector2.ZERO
+
+	# 編輯面板：準心對準門 → 縮放 / 平移（中心對稱、遇到邊界停住）
+	main.player.camera.force_update_transform()
+	var tgt: Dictionary = main._pick_target()
+	check(tgt.get("kind", "") == "portal", "準心對準門：選到傳送門（%s）" % str(tgt))
+	if tgt.get("kind", "") == "portal":
+		main._open_target("portal", tgt["id"])
+		check(main.hud.is_panel_open() and not main.hud.modal_open, "編輯面板開著，但不阻擋走動")
+		var pt = main.model.portals[tgt["id"]]
+		var w0: float = pt.size.x
+		var c0: Vector3 = pt.local_pos
+		main._on_edit_action("pw+")
+		check(near(pt.size.x, w0 + 0.2), "門變寬 0.2 m")
+		check(near(pt.local_pos.z, c0.z) or near(pt.local_pos.x, c0.x), "從中心對稱縮放：中心不動")
+		for i in range(40):
+			main._on_edit_action("pw+")
+		check(pt.size.x <= 8.0 and pt.size.x >= w0 + 0.2, "一直加寬會停在牆面邊界（寬 %.1f）" % pt.size.x)
+		main._on_edit_action("pm:left")
+		check(main.model.validate().is_empty(), "平移後資料完整")
+		main._on_edit_action("pw-")
+		main.hud.handle_back()
+		check(not main.hud.is_panel_open(), "返回鍵關閉編輯面板")
+
+	# 放平台 → 調整 → 刪除
+	var n_struct_before: int = main.model.structures.size()
+	main._on_build_requested("platform")
+	check(main.model.structures.size() == n_struct_before + 1, "選單：放平台")
+	var plat_id: String = main._target.get("id", "")
+	check(plat_id != "" and main.model.structures.has(plat_id), "放好後自動打開平台編輯面板")
+	var plat = main.model.structures[plat_id]
+	var y0: float = plat.pos.y
+	main._on_edit_action("ph+")
+	check(near(plat.pos.y, y0 + 0.5), "平台升高 0.5 m")
+	var area0: float = plat.size.x * plat.size.y
+	main._on_edit_action("ps:w+")
+	main._on_edit_action("ps:l+")
+	check(plat.size.x * plat.size.y > area0, "平台變寬 / 變長")
+	main._on_edit_action("sdel")
+	main.hud._confirm_cb.call()
+	check(not main.model.structures.has(plat_id) and main.model.validate().is_empty(), "刪除平台")
+	main._on_build_requested("railing")
+	var rail_id: String = main._target.get("id", "")
+	check(rail_id != "" and main.model.structures[rail_id].kind == "railing", "選單：放欄桿")
+	var len0: float = main.model.structures[rail_id].length
+	main._on_edit_action("rl-")
+	check(near(main.model.structures[rail_id].length, len0 - 0.5), "欄桿縮短 0.5 m")
+	main._on_edit_action("rl+")
+	check(near(main.model.structures[rail_id].length, len0), "欄桿再加長 0.5 m 回到原長")
+	main._on_edit_action("rrot")
+	main.hud.handle_back()
+	main.model.structures.erase(rail_id)
+	main.model.cells["cell_0001"].structures.erase(rail_id)
+	main._rebuild_cell("cell_0001")
 
 	# 蓋樓梯，再實際走上去
 	main.player.place_in_cell("cell_0001", Vector3(4, 0.05, 6.5), 0.0)
@@ -1343,3 +1416,103 @@ func test_main_scene() -> void:
 	main2.queue_free()
 	await process_frame
 	ST.Io.remove_tree("user://palace")
+
+
+# ------------------------------------------------------------------ (1f) 建材調整：夾在房間內、旋轉、移動
+
+func test_structure_adjust() -> void:
+	print("[1f] 建材調整（平台 / 欄桿 / 斜坡）")
+	var m = SM.PalaceModel.new()
+	var c = m.create_cell("甲", "ivory", Vector3(8, 3, 6))
+	var pl = m.add_platform(c.id, Vector3(1, 0.3, 1), Vector2(2, 2), 0.3)
+	check(m.adjust_structure(pl.id, "size_x", 1.0)["changed"] and near(pl.size.x, 3.0), "平台加寬 1 m")
+	m.adjust_structure(pl.id, "size_x", 100.0)
+	check(near(pl.size.x, 7.0), "平台寬度夾在房間內（x=1 → 最多 7）")
+	m.adjust_structure(pl.id, "size_z", -100.0)
+	check(near(pl.size.y, 0.5), "平台最小 0.5 m")
+	m.adjust_structure(pl.id, "height", 0.5)
+	check(near(pl.pos.y, 0.8), "平台高度 +0.5")
+	m.adjust_structure(pl.id, "height", 100.0)
+	check(near(pl.pos.y, 2.7), "平台高度最高到天花板下 0.3 m")
+	check(not m.adjust_structure(pl.id, "length", 1.0)["ok"], "平台沒有 length 操作")
+	m.move_structure(pl.id, Vector3(100, 0.3, -5))
+	check(near(pl.pos.x, 7.5) and near(pl.pos.z, 0.0), "平台移動後夾在房間內")
+	check(near(pl.size.x, 0.5), "平台靠邊時尺寸跟著縮到放得下")
+
+	var rl = m.add_railing(c.id, Vector3(2, 0, 2), Vector3.RIGHT, 2.0)
+	m.adjust_structure(rl.id, "length", 1.0)
+	check(near(rl.length, 3.0), "欄桿加長")
+	m.adjust_structure(rl.id, "length", 100.0)
+	check(near(rl.length, 6.0), "欄桿長度夾在牆內（x=2 往 +X 最多 6）")
+	m.adjust_structure(rl.id, "rotate")
+	check(rl.horizontal_dir().is_equal_approx(Vector3(0, 0, 1)), "欄桿轉 90°：+X → +Z")
+	check(near(rl.length, 4.0), "轉向後長度夾到新方向可用空間（z=2 往 +Z 最多 4）")
+	m.adjust_structure(rl.id, "rotate")
+	m.adjust_structure(rl.id, "rotate")
+	m.adjust_structure(rl.id, "rotate")
+	check(rl.horizontal_dir().is_equal_approx(Vector3(1, 0, 0)), "轉四次回到原方向")
+
+	var rp = m.add_ramp(c.id, Vector3(1, 0, 3), Vector3.RIGHT, 1.0, 2.0, 1.0)
+	m.adjust_structure(rp.id, "height", 0.5)
+	m.adjust_structure(rp.id, "length", 1.0)
+	m.adjust_structure(rp.id, "width", 1.0)
+	check(near(rp.height, 1.5) and near(rp.length, 3.0) and near(rp.width, 2.0), "斜坡高 / 長 / 寬各自調整")
+	m.adjust_structure(rp.id, "width", 100.0)
+	check(near(rp.width, 6.0), "斜坡寬度夾在兩側牆內（z=3 → 最寬 6）")
+	m.adjust_structure(rp.id, "height", 100.0)
+	check(near(rp.height, 2.8), "斜坡最高 = 房高 − 0.2")
+	check(not m.adjust_structure("nope", "length", 1.0)["ok"], "找不到建材")
+	check(m.validate().is_empty(), "調整後資料完整")
+	# 擴建仍可作用在調整後的建材
+	var r: Dictionary = m.split_and_stretch(c.id, 0, 4.0, 2.0)
+	check(r["ok"] and m.validate().is_empty(), "調整後的建材可以正常擴建")
+
+
+func test_font_setup() -> void:
+	print("[1g] 系統中文字型挑選")
+	check(FS.rank_name("NotoSansTC-Regular.otf") == 0, "NotoSansTC 排第一")
+	check(FS.rank_name("NotoSansCJK-Regular.ttc") < FS.rank_name("DroidSansFallback.ttf"), "CJK 合集優先於 DroidSansFallback")
+	check(FS.rank_name("Roboto-Regular.ttf") == -1, "拉丁字型不算中文字型")
+	check(FS.rank_name("readme.txt") == -1, "非字型檔略過")
+	check(FS.rank_name("NotoSansCJK-Bold.ttc") > FS.rank_name("NotoSansCJK-Regular.ttc"), "粗體排在一般體之後")
+	var files := PackedStringArray(["Roboto-Regular.ttf", "NotoSansCJK-Bold.ttc", "DroidSansFallback.ttf", "NotoSansCJK-Regular.ttc", "x.txt"])
+	check(FS.pick(files) == "NotoSansCJK-Regular.ttc", "pick 選出 NotoSansCJK-Regular.ttc")
+	check(FS.pick(PackedStringArray(["Roboto-Regular.ttf"])) == "", "沒有中文字型 → 空字串")
+	check(FS.pick(PackedStringArray(["SECCJK-Regular.otf"])) == "SECCJK-Regular.otf", "三星字型也認得")
+
+
+## 自動跨階：0.3 m 的台階走得上去，0.6 m 的擋得住
+func test_player_step_up() -> void:
+	print("[5f] 玩家控制：膝蓋自動跨階（0.35 m）")
+	await process_frame
+	var m = SM.PalaceModel.new()
+	var a = m.create_cell("甲", "ivory", Vector3(10, 3, 6))
+	m.add_platform(a.id, Vector3(3, 0.3, 1), Vector2(3, 4), 0.3)      # 頂面 0.3：低台階
+	m.add_platform(a.id, Vector3(7, 0.6, 1), Vector2(2, 4), 0.6)      # 頂面 0.6：太高
+	m.activate_cell(a.id)
+	var scene := Node3D.new()
+	root.add_child(scene)
+	scene.add_child(RB.build_cell(m, a.id))
+	var player = PC.new()
+	scene.add_child(player)
+	player.setup(m, null)
+	player.place_in_cell(a.id, Vector3(1, 0.05, 3), -PI / 2.0)
+	for i in range(30):
+		await physics_frame
+	player.move_input = Vector2(0, -1)
+	for i in range(100):
+		await physics_frame
+		if player.global_position.x > 4.0:
+			break
+	check(player.global_position.x > 4.0 and absf(player.global_position.y - 0.3) < 0.06, "0.3 m 台階：自動跨上去（x=%.2f y=%.2f）" % [player.global_position.x, player.global_position.y])
+	for i in range(150):
+		await physics_frame
+		if player.global_position.x > 6.0:
+			break
+	check(player.global_position.x > 5.8, "走過台階頂面（x=%.2f）" % player.global_position.x)
+	for i in range(120):
+		await physics_frame
+	check(player.global_position.x < 7.0 and player.global_position.y < 0.1, "從台階走下來後被 0.6 m 的高台擋住（x=%.2f y=%.2f）" % [player.global_position.x, player.global_position.y])
+	player.move_input = Vector2.ZERO
+	scene.queue_free()
+	await process_frame

@@ -345,7 +345,9 @@ class SaveStore:
 class SettingsStore:
 	const DEFAULTS := {
 		"look_sensitivity": 1.0,
-		"max_visible_portals": 6,
+		"max_visible_portals": 4,
+		"max_fps": 30,               # 30 或 60；預設 30 以降低發熱
+		"render_scale": 0.75,        # 3D 解析度比例：0.5 / 0.75 / 1.0
 		"button_layout": "default",  # 預留
 		"mirror_ui": false,          # 預留
 	}
@@ -364,6 +366,11 @@ class SettingsStore:
 			out["look_sensitivity"] = clampf(float(raw["look_sensitivity"]), 0.2, 3.0)
 		if raw.has("max_visible_portals"):
 			out["max_visible_portals"] = clampi(int(raw["max_visible_portals"]), 1, 12)
+		if raw.has("max_fps"):
+			out["max_fps"] = 60 if int(raw["max_fps"]) >= 45 else 30
+		if raw.has("render_scale"):
+			var rs := float(raw["render_scale"])
+			out["render_scale"] = 0.5 if rs < 0.625 else (0.75 if rs < 0.875 else 1.0)
 		if raw.has("button_layout"):
 			out["button_layout"] = "default"
 		if raw.has("mirror_ui"):

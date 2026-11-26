@@ -1,13 +1,12 @@
 extends CanvasLayer
 ## ui_hud.gd — 觸控介面（全部用程式建立，不需要編輯器）
 ##
-##   常駐：左上 ☰ 選單、右下 ＋（放記憶方塊）與 ↑（跳）、準心、搖桿圈、房間名稱與提示訊息。
-##   面板：選單、記憶內容編輯、記憶檢視（三層：形狀 → 15 字提示 → 點開才看到的詳情）、
+##   常駐：左上「選單」、右下「放置」與「編輯」、準心、搖桿圈、房間名稱與提示訊息。（沒有跳躍鍵：低台階自動跨上、斜坡直接走。）
+##   面板：選單、記憶內容編輯、記憶檢視（三層：形狀、15 字提示、點開才看到的詳情）、
 ##         擴建（拉開空間）、房間列表、設定、確認視窗。
 ##   HUD 只發出訊號、顯示資料；所有資料修改都在 main.gd。
 ##   面板開啟時 modal_open = true，main 會暫停玩家操作。
 
-signal jump_pressed
 signal add_requested(kind: String)            # "blank" | "import_native" | "import_drop"
 signal door_requested(kind: String)           # "front" | "up" | "down"
 signal stretch_begin_requested
@@ -23,11 +22,17 @@ signal room_selected(cell_id: String)
 signal rooms_requested
 signal settings_requested
 signal edit_requested(node_id: String)
+signal edit_target_requested                  # 編輯準心對準的門 / 建材
+signal build_requested(kind: String)          # "platform" | "railing"
+signal edit_action(action_id: String)         # 門 / 建材編輯面板的按鈕
+signal editor_closed
 signal room_theme_next_requested
 signal settings_changed(values: Dictionary)
 signal backup_export_requested
 signal backup_import_requested
 signal modal_changed(open: bool)
+
+const FS = preload("res://scripts/font_setup.gd")
 
 const PROMPT_MAX := 15
 const COLOR_PANEL := Color(0.07, 0.08, 0.12, 0.93)
@@ -64,18 +69,29 @@ var _rooms_box: VBoxContainer
 var _settings_values := {}
 var _settings_labels: Dictionary = {}
 var _confirm_label: Label
+var _target_title: Label
+var _target_info: Label
+var _target_rows: VBoxContainer
 
 
-## 畫準心與搖桿
+## 畫準心與搖桿。只在狀態改變時重畫（靜止時完全不重畫，手機才不會一直發熱）
 class Overlay extends Control:
 	var hud = null
+	var _sig := ""
 
 	func _ready() -> void:
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
 		set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		resized.connect(queue_redraw)
 
 	func _process(_d: float) -> void:
-		queue_redraw()
+		var pl = hud.player if hud != null else null
+		var sig := "-"
+		if pl != null and pl.joystick_active:
+			sig = "%s|%s" % [str(pl.joystick_origin), str(pl.joystick_pos)]
+		if sig != _sig:
+			_sig = sig
+			queue_redraw()
 
 	func _draw() -> void:
 		var c := size * 0.5
@@ -99,6 +115,9 @@ func _ready() -> void:
 	_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	var th := Theme.new()
 	th.default_font_size = 34
+	var cjk: Font = FS.load_cjk()
+	if cjk != null:
+		th.default_font = cjk
 	_root.theme = th
 	add_child(_root)
 
@@ -114,6 +133,7 @@ func _ready() -> void:
 	_build_rooms()
 	_build_settings()
 	_build_confirm()
+	_build_target_editor()
 
 
 # ====================================================================== 對外 API
@@ -157,6 +177,8 @@ func handle_back() -> bool:
 			stretch_cancelled.emit()
 		"viewer":
 			viewer_closed.emit()
+		"target":
+			editor_closed.emit()
 	_open("")
 	return true
 
@@ -206,6 +228,29 @@ func show_settings(values: Dictionary) -> void:
 	_settings_values = values.duplicate()
 	_refresh_settings_labels()
 	_open("settings")
+
+
+## 門 / 建材編輯面板。rows = [[ [按鈕文字, 動作id], ... ], ...]，每個內層陣列是一列。
+## 面板不阻擋操作：可一邊走動、轉視角，一邊用「移到準心」調整位置。
+func show_editor(title: String, info: String, rows: Array) -> void:
+	_target_title.text = title
+	_target_info.text = info
+	for ch in _target_rows.get_children():
+		_target_rows.remove_child(ch)
+		ch.queue_free()
+	for row in rows:
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", 10)
+		for item in row:
+			var aid: String = item[1]
+			var b := _btn(item[0], func(): edit_action.emit(aid), Vector2(0, 84))
+			b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			hb.add_child(b)
+		_target_rows.add_child(hb)
+	if _current_panel != "target":
+		_open("target")
+	else:
+		_place_panel(_panels["target"])
 
 
 func confirm(text: String, on_yes: Callable) -> void:
@@ -289,21 +334,18 @@ func _build_hud_buttons() -> void:
 	_toast.visible = false
 	_root.add_child(_toast)
 
-	var menu := _btn("☰", func(): _open("menu"), Vector2(130, 130))
-	menu.add_theme_font_size_override("font_size", 56)
+	var menu := _btn("選單", func(): _open("menu"), Vector2(170, 110))
 	menu.position = Vector2(30, 30)
 	_root.add_child(menu)
 
-	var add := _btn("＋", func(): add_requested.emit("blank"), Vector2(150, 150))
-	add.add_theme_font_size_override("font_size", 72)
+	var edit := _btn("編輯", func(): edit_target_requested.emit(), Vector2(190, 120))
+	_root.add_child(edit)
+	edit.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT, Control.PRESET_MODE_MINSIZE, 40)
+
+	var add := _btn("放置", func(): add_requested.emit("blank"), Vector2(190, 120))
 	_root.add_child(add)
 	add.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT, Control.PRESET_MODE_MINSIZE, 40)
-	add.position -= Vector2(0, 190)
-
-	var jmp := _btn("↑", func(): jump_pressed.emit(), Vector2(150, 150))
-	jmp.add_theme_font_size_override("font_size", 72)
-	_root.add_child(jmp)
-	jmp.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT, Control.PRESET_MODE_MINSIZE, 40)
+	add.position -= Vector2(0, 150)
 
 
 func _build_menu() -> void:
@@ -318,20 +360,30 @@ func _build_menu() -> void:
 	v.add_theme_constant_override("separation", 12)
 	scroll.add_child(v)
 	var items := [
+		["", "記憶"],
 		["放一個空白記憶方塊", "blank"],
-		["匯入圖片 / 3D 模型（系統選檔）", "import_native"],
+		["匯入圖片或 3D 模型（系統選檔）", "import_native"],
 		["掃描匯入資料夾（備用）", "import_drop"],
-		["前方開門 → 新房間", "door_front"],
-		["蓋樓梯上樓 → 新房間", "door_up"],
-		["挖樓梯下樓 → 新房間", "door_down"],
+		["", "建造"],
+		["前方開門，通往新房間", "door_front"],
+		["蓋樓梯上樓，通往新房間", "door_up"],
+		["挖樓梯下樓，通往新房間", "door_down"],
+		["放一個平台（二樓地板）", "build_platform"],
+		["放一段欄桿", "build_railing"],
+		["編輯準心對準的門或建材", "edit_target"],
 		["擴建：在這裡拉開空間", "stretch"],
-		["房間列表 / 前往", "rooms"],
+		["", "房間"],
+		["房間列表與前往", "rooms"],
 		["換這間房的主題", "theme"],
+		["", "系統"],
 		["設定", "settings"],
 		["備份匯出", "backup_export"],
 		["還原備份", "backup_import"],
 	]
 	for it in items:
+		if it[0] == "":
+			v.add_child(_label("- %s -" % it[1], 30, COLOR_ACCENT))
+			continue
 		var tag: String = it[1]
 		v.add_child(_btn(it[0], func(): _menu_pick(tag)))
 	outer.add_child(_btn("關閉", func(): _open("")))
@@ -350,6 +402,12 @@ func _menu_pick(tag: String) -> void:
 			door_requested.emit("down")
 		"stretch":
 			stretch_begin_requested.emit()
+		"build_platform":
+			build_requested.emit("platform")
+		"build_railing":
+			build_requested.emit("railing")
+		"edit_target":
+			edit_target_requested.emit()
 		"rooms":
 			rooms_requested.emit()
 		"theme":
@@ -495,8 +553,8 @@ func _build_settings() -> void:
 		lab.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		_settings_labels[key] = [lab, def[1]]
 		row.add_child(lab)
-		row.add_child(_btn("−", func(): _settings_step(key, -step, lo, hi), Vector2(100, 90)))
-		row.add_child(_btn("＋", func(): _settings_step(key, step, lo, hi), Vector2(100, 90)))
+		row.add_child(_btn("-", func(): _settings_step(key, -step, lo, hi), Vector2(100, 90)))
+		row.add_child(_btn("+", func(): _settings_step(key, step, lo, hi), Vector2(100, 90)))
 		v.add_child(row)
 	var swap := _btn("", func():
 		_settings_values["mirror_ui"] = not bool(_settings_values.get("mirror_ui", false))
@@ -504,6 +562,19 @@ func _build_settings() -> void:
 		settings_changed.emit(_settings_values.duplicate()))
 	_settings_labels["mirror_ui"] = [swap, "左右互換（搖桿在右、視角在左）"]
 	v.add_child(swap)
+	var fps := _btn("", func():
+		_settings_values["max_fps"] = 60 if int(_settings_values.get("max_fps", 30)) == 30 else 30
+		_refresh_settings_labels()
+		settings_changed.emit(_settings_values.duplicate()))
+	_settings_labels["max_fps"] = [fps, "更新率（30 較省電不發熱）"]
+	v.add_child(fps)
+	var quality := _btn("", func():
+		var cur := float(_settings_values.get("render_scale", 0.75))
+		_settings_values["render_scale"] = 1.0 if cur < 0.6 else (0.5 if cur > 0.9 else 0.75)
+		_refresh_settings_labels()
+		settings_changed.emit(_settings_values.duplicate()))
+	_settings_labels["render_scale"] = [quality, "畫質"]
+	v.add_child(quality)
 	v.add_child(_btn("關閉", func(): _open("")))
 
 
@@ -523,6 +594,11 @@ func _refresh_settings_labels() -> void:
 		var v: Variant = _settings_values.get(key)
 		if key == "mirror_ui":
 			(node as Button).text = "%s：%s" % [title, "開" if bool(v) else "關"]
+		elif key == "max_fps":
+			(node as Button).text = "%s：%d fps" % [title, int(v)]
+		elif key == "render_scale":
+			var q := float(v)
+			(node as Button).text = "%s：%s" % [title, "高" if q > 0.9 else ("低" if q < 0.6 else "中")]
 		elif key == "look_sensitivity":
 			(node as Label).text = "%s　%.1f" % [title, float(v)]
 		else:
@@ -557,7 +633,7 @@ func _open(name: String) -> void:
 		if k == name:
 			_place_panel(pc)
 	_current_panel = name
-	var now_modal := name != ""
+	var now_modal := name != "" and name != "target"     # 編輯門 / 建材時仍可走動、轉視角
 	if now_modal != modal_open:
 		modal_open = now_modal
 		modal_changed.emit(modal_open)
@@ -574,3 +650,17 @@ func _place_panel(pc: Control) -> void:
 		pc.position = Vector2((vp.x - sz.x) * 0.5, vp.y - sz.y - 30)
 	else:
 		pc.position = Vector2((vp.x - sz.x) * 0.5, maxf((vp.y - sz.y) * 0.5, 10.0))
+
+
+func _build_target_editor() -> void:
+	var v := _make_panel("target", "", "bottom", 1500)
+	_target_title = _label("", 42, COLOR_ACCENT)
+	v.add_child(_target_title)
+	_target_info = _label("", 30)
+	v.add_child(_target_info)
+	_target_rows = VBoxContainer.new()
+	_target_rows.add_theme_constant_override("separation", 10)
+	v.add_child(_target_rows)
+	v.add_child(_btn("完成", func():
+		_open("")
+		editor_closed.emit(), Vector2(0, 90)))
