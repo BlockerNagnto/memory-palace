@@ -13,6 +13,9 @@ signal stretch_begin_requested
 signal stretch_changed(delta: float)
 signal stretch_confirmed(delta: float)
 signal stretch_cancelled
+signal stretch_dir_requested(kind: int)         # 0 前 / 1 後 / 2 左 / 3 右（以按下當時的視角為準）
+signal stretch_offset_step(step: float)          # 切線離自己的距離 ±
+signal stretch_crosshair_requested               # 把切線設在準心位置
 signal node_saved(node_id: String, prompt: String, detail: String, is_new: bool)
 signal node_deleted(node_id: String)
 signal node_move_requested(node_id: String)
@@ -65,6 +68,8 @@ var _viewer_id := ""
 var _stretch_label: Label
 var _stretch_delta := 2.0
 var _stretch_info := ""
+var _stretch_dir_btns: Array = []
+var _stretch_kind := 0
 var _rooms_box: VBoxContainer
 var _settings_values := {}
 var _settings_labels: Dictionary = {}
@@ -202,11 +207,17 @@ func show_node_viewer(mem) -> void:
 	_open("viewer")
 
 
-func show_stretch(info: String, start_delta: float) -> void:
-	_stretch_info = info
-	_stretch_delta = start_delta
-	_refresh_stretch_label()
+func show_stretch(info: String, start_delta: float, kind: int = 0) -> void:
+	update_stretch(info, start_delta, kind)
 	_open("stretch")
+
+
+## 只更新擴建面板上的文字與選取狀態（不重新開面板）
+func update_stretch(info: String, delta: float, kind: int) -> void:
+	_stretch_info = info
+	_stretch_delta = delta
+	_stretch_kind = kind
+	_refresh_stretch_label()
 
 
 func show_rooms(rooms: Array, current_id: String) -> void:
@@ -318,8 +329,13 @@ func _build_hud_buttons() -> void:
 	_room_label = _label("", 34)
 	_room_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
 	_room_label.add_theme_constant_override("outline_size", 8)
-	_room_label.set_anchors_and_offsets_preset(Control.PRESET_CENTER_TOP, Control.PRESET_MODE_MINSIZE, 30)
-	_room_label.position.y = 28
+	_room_label.autowrap_mode = TextServer.AUTOWRAP_OFF
+	_room_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_room_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
+	_room_label.offset_left = 200.0
+	_room_label.offset_right = -200.0
+	_room_label.offset_top = 28.0
+	_room_label.offset_bottom = 80.0
 	_room_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_root.add_child(_room_label)
 
@@ -488,9 +504,24 @@ func _build_viewer() -> void:
 
 
 func _build_stretch() -> void:
-	var v := _make_panel("stretch", "擴建", "bottom", 1300)
-	_stretch_label = _label("", 34)
+	var v := _make_panel("stretch", "擴建", "bottom", 1400)
+	_stretch_label = _label("", 32)
 	v.add_child(_stretch_label)
+
+	v.add_child(_label("新空間要出現在哪一邊？", 28, Color(0.75, 0.85, 1.0)))
+	var dir_row := HBoxContainer.new()
+	dir_row.add_theme_constant_override("separation", 10)
+	_stretch_dir_btns.clear()
+	var names := ["前方", "後方", "左邊", "右邊"]
+	for i in range(4):
+		var k: int = i
+		var b := _btn(names[i], func(): stretch_dir_requested.emit(k), Vector2(0, 90))
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		dir_row.add_child(b)
+		_stretch_dir_btns.append(b)
+	v.add_child(dir_row)
+
+	v.add_child(_label("新空間有多深（公尺）", 28, Color(0.75, 0.85, 1.0)))
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 10)
 	for step in [-2.0, -0.5, 0.5, 2.0]:
@@ -499,6 +530,20 @@ func _build_stretch() -> void:
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		row.add_child(b)
 	v.add_child(row)
+
+	v.add_child(_label("切線離你多遠（公尺）", 28, Color(0.75, 0.85, 1.0)))
+	var row_off := HBoxContainer.new()
+	row_off.add_theme_constant_override("separation", 10)
+	for step in [-0.5, 0.5]:
+		var o: float = step
+		var b := _btn("%+.1f" % o, func(): stretch_offset_step.emit(o), Vector2(0, 90))
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row_off.add_child(b)
+	var cross := _btn("切在準心", func(): stretch_crosshair_requested.emit(), Vector2(0, 90))
+	cross.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row_off.add_child(cross)
+	v.add_child(row_off)
+
 	var row2 := HBoxContainer.new()
 	row2.add_theme_constant_override("separation", 12)
 	var ok := _btn("拉開", func():
@@ -521,7 +566,11 @@ func _stretch_step(s: float) -> void:
 
 
 func _refresh_stretch_label() -> void:
-	_stretch_label.text = "%s\n拉開 %.1f 公尺（藍色面 = 切線與新牆）" % [_stretch_info, _stretch_delta]
+	_stretch_label.text = _stretch_info
+	var names := ["前方", "後方", "左邊", "右邊"]
+	for i in range(_stretch_dir_btns.size()):
+		var b: Button = _stretch_dir_btns[i]
+		b.text = ("● " if i == _stretch_kind else "") + names[i]
 
 
 func _build_rooms() -> void:

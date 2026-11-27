@@ -164,6 +164,9 @@ class Surface extends Node3D:
 		var n: Vector3 = p.normal.normalized()
 		material.set_shader_parameter("clip_plane", Vector4(n.x, n.y, n.z, -n.dot(p.local_pos)))
 
+	func set_fog(amount: float) -> void:
+		material.set_shader_parameter("fog_amount", amount)
+
 	func set_texture(tex: Texture2D) -> void:
 		material.set_shader_parameter("viewport_tex", tex)
 
@@ -179,6 +182,15 @@ class PortalView extends RefCounted:
 	var camera: Camera3D
 	var active := false
 	var frozen := false      # 畫面沒變：停止更新、保留最後一張貼圖（省電、降溫）
+	var key := ""            # 目前專屬的「門」（固定綁定，不會因為排序變動而換門 → 不會閃黑）
+	var rendered_frames := 0 # 已連續渲染幀數；≥ WARM_FRAMES 才算貼圖有內容
+	var last_used := 0       # 最後一次被規劃使用的幀（回收時挑最久沒用的）
+
+	func has_content() -> bool:
+		return rendered_frames >= 2
+
+	func reset_content() -> void:
+		rendered_frames = 0
 
 	func set_active(on: bool) -> void:
 		if on == active:
@@ -214,6 +226,9 @@ var _last_cam_xf := Transform3D()
 var _last_sig := ""
 var _still_frames := 0
 const STILL_FRAMES_TO_FREEZE := 3
+const WARM_FRAMES := 2               # 視圖剛分配後，先渲染 2 幀才拿來顯示（之前顯示霧色，不顯示黑）
+var _frame_no := 0
+var _key_view: Dictionary = {}      # 門的鍵（含上層路徑）→ 視圖索引，固定綁定
 
 
 func _ready() -> void:
@@ -246,6 +261,11 @@ func request_update() -> void:
 
 func rebuild_surfaces() -> void:
 	_still_frames = 0
+	_key_view.clear()
+	for v: PortalView in _views:
+		v.key = ""
+		v.reset_content()
+		v.set_active(false)
 	for s in _l0.values():
 		s.queue_free()
 	_l0.clear()
@@ -316,6 +336,7 @@ func _ensure_view_size(vp: Vector2) -> void:
 	_still_frames = 0
 	for v: PortalView in _views:
 		v.viewport.size = s
+		v.reset_content()
 
 
 func _get_view(index: int) -> PortalView:
@@ -345,25 +366,90 @@ func _get_clone(slot: int, portal_id: String) -> Surface:
 	return s
 
 
+## 為規劃裡的每個視圖找出固定的鍵：一級 = 門編號；二級 = 上層鍵 + ">" + 門編號
+static func plan_keys(plan: Array) -> Array:
+	var keys: Array = []
+	for i in range(plan.size()):
+		var spec: Dictionary = plan[i]
+		var parent: int = spec["parent"]
+		if parent >= 0 and parent < keys.size():
+			keys.append("%s>%s" % [keys[parent], spec["portal_id"]])
+		else:
+			keys.append(str(spec["portal_id"]))
+	return keys
+
+
+## 固定綁定：同一扇門永遠用同一個視圖（除非被回收），這樣排序變動時貼圖不會換手、不會閃黑。
+## 回傳 鍵 → 視圖索引。
+func _assign_views(keys: Array) -> Dictionary:
+	var want := {}
+	for k in keys:
+		want[k] = true
+	var used := {}   # 本幀已被占用的視圖索引
+	var out := {}
+	for k in keys:
+		if _key_view.has(k):
+			var vi: int = _key_view[k]
+			out[k] = vi
+			used[vi] = true
+	for k in keys:
+		if out.has(k):
+			continue
+		# 找可回收的視圖：先找沒綁定的，其次找綁定在「本幀用不到的門」且最久沒用的
+		var best := -1
+		var best_used := 1 << 60
+		for vi in range(_views.size()):
+			if used.has(vi):
+				continue
+			var v: PortalView = _views[vi]
+			if v.key == "":
+				best = vi
+				break
+			if not want.has(v.key) and v.last_used < best_used:
+				best = vi
+				best_used = v.last_used
+		if best < 0:
+			_get_view(_views.size())
+			best = _views.size() - 1
+		var vv: PortalView = _views[best]
+		if vv.key != "":
+			_key_view.erase(vv.key)
+		vv.key = k
+		vv.reset_content()
+		_key_view[k] = best
+		out[k] = best
+		used[best] = true
+	return out
+
+
 func _apply_plan(plan: Array, cam_pos: Vector3) -> void:
+	_frame_no += 1
 	for s in _l0.values():
 		s.visible = false
 	for s in _clones.values():
 		s.visible = false
 
+	var keys := plan_keys(plan)
+	var assigned := _assign_views(keys)
+	var in_use := {}
 	var slot_of_view := {}   # 規劃索引 -> 一級視圖的複本槽位
 	var dead := {}           # 目標房間尚未啟用（沒有視覺層）的視圖，改顯示霧色
 	var next_slot := 0
 	for i in range(plan.size()):
 		var spec: Dictionary = plan[i]
-		var view := _get_view(i)
+		var view: PortalView = _views[assigned[keys[i]]]
 		var tcell = model.cells.get(spec["cell_id"])
 		var parent: int = spec["parent"]
 		if tcell == null or tcell.render_layer <= 0 or (parent >= 0 and dead.has(parent)):
 			dead[i] = true
 			view.set_active(false)
+			view.reset_content()
 			continue
+		in_use[view] = true
+		view.last_used = _frame_no
 		view.set_active(true)
+		if not view.frozen:
+			view.rendered_frames += 1
 		var cam := view.camera
 		cam.global_transform = spec["xf"]
 		cam.fov = main_camera.fov
@@ -379,11 +465,13 @@ func _apply_plan(plan: Array, cam_pos: Vector3) -> void:
 
 		var p = model.portals[spec["portal_id"]]
 		var tex := view.viewport.get_texture()
+		var fog := 0.0 if view.has_content() else 1.0
 		if spec["depth"] == 1:
 			var s: Surface = _l0.get(p.id)
 			if s != null:
 				s.configure(p, Logic.L0_LAYER_BIT)
 				s.set_texture(tex)
+				s.set_fog(fog)
 				s.set_recessed(Logic.recess_needed(p, cam_pos))
 				s.visible = true
 		else:
@@ -392,10 +480,12 @@ func _apply_plan(plan: Array, cam_pos: Vector3) -> void:
 				var c := _get_clone(slot, p.id)
 				c.configure(p, 1 << (Logic.CLONE_FIRST_BIT_INDEX + slot))
 				c.set_texture(tex)
+				c.set_fog(fog)
 				c.set_recessed(false)
 				c.visible = true
-	for j in range(plan.size(), _views.size()):
-		_views[j].set_active(false)
+	for v: PortalView in _views:
+		if not in_use.has(v):
+			v.set_active(false)
 
 
 ## 偵測眼睛由 prev_eye 走到 eye 是否穿過目前房間的某扇已配對傳送門。

@@ -38,6 +38,7 @@ func _run() -> void:
 	test_split_and_stretch()
 	test_stretch_z_axis()
 	test_portal_placement()
+	test_portal_pair_resize()
 	test_layer_allocation()
 	test_deletions()
 	test_structure_adjust()
@@ -50,6 +51,7 @@ func _run() -> void:
 	test_settings()
 	test_room_builder_logic()
 	test_portal_system_logic()
+	test_portal_view_slots()
 	test_memory_loaders()
 	test_memory_views()
 	test_player_logic()
@@ -269,8 +271,8 @@ func test_portal_placement() -> void:
 	r = m.resize_portal(a.id, Vector2(10.0, 2.2))
 	check(r["ok"] and r["limited_u"] and r["reason_u"] == "portal" and near(a.size.x, 3.0), "放大到 10：被相鄰門限制在 3.0，原因 portal")
 	r = m.resize_portal(a.id, Vector2(3.0, 5.0))
-	check(r["ok"] and r["limited_v"] and r["reason_v"] == "wall" and near(a.size.y, 2.2), "放大高度到 5：被地板限制在 2.2（中心高 1.1），原因 wall")
-	check(near_v3(a.local_pos, center_before, 1e-6), "多次縮放後中心仍不動")
+	check(r["ok"] and r["limited_v"] and r["shifted"] and near(a.size.y, 3.0), "放大高度到 5：先閃開地板，再被整面牆高限制在 3.0")
+	check(near(a.local_pos.x, center_before.x, 1e-6) and near(a.local_pos.y, 1.5, 1e-5), "頂到地板時整扇門往上閃開（中心高 1.5），左右位置不動")
 	r = m.resize_portal(a.id, Vector2(1.0, 1.0))
 	check(r["ok"] and near(a.size.x, 1.0) and near(a.size.y, 1.0), "可縮小")
 
@@ -307,7 +309,7 @@ func test_portal_placement() -> void:
 	r = m.resize_portal(h.id, Vector2(2.0, 3.0))
 	check(r["ok"] and near(h.size.x, 2.0) and near(h.size.y, 3.0) and not r["limited_v"], "水平開口自訂寬長 2×3")
 	r = m.resize_portal(h.id, Vector2(2.0, 6.0))
-	check(r["ok"] and r["limited_v"] and near(h.size.y, 4.0), "水平開口長度被牆限制：中心 z=2 → 最長 4")
+	check(r["ok"] and r["shifted"] and near(h.size.y, 6.0) and near(h.local_pos.z, 3.0, 1e-5), "水平開口放大到整面深：中心 z=2 的開口往牆的反方向閃開到 z=3")
 	var ceil_p = _place(m, c.id, 5, Vector3(3, 3, 2))
 	check(near_v3(ceil_p.normal, Vector3.DOWN) and near(ceil_p.local_pos.y, 3.0), "天花板開口法線向下、位於 y=size.y")
 
@@ -1399,6 +1401,34 @@ func test_main_scene() -> void:
 	main._confirm_stretch(2.0)
 	check(near(main.model.cells["cell_0001"].size.z, z_before + 2.0), "擴建：沿前進方向拉開 2 公尺")
 	check(main.model.validate().is_empty(), "擴建後資料完整")
+	check(near(main.player.global_position.z, 6.0, 0.01), "預設：切線在前方 1 公尺（z=3），腳下在正側 → 玩家被推到另一側（z=4→6）")
+
+	# 擴建：方向 / 位置 / 玩家規則
+	check(main._stretch_dir_vec(0).is_equal_approx(Vector3(0, 0, -1)), "視角朝前時：前方 = −Z")
+	check(main._stretch_dir_vec(1).is_equal_approx(Vector3(0, 0, 1)), "後方 = +Z")
+	check(main._stretch_dir_vec(2).is_equal_approx(Vector3(-1, 0, 0)), "左邊 = −X")
+	check(main._stretch_dir_vec(3).is_equal_approx(Vector3(1, 0, 0)), "右邊 = +X")
+	var z2: float = main.model.cells["cell_0001"].size.z
+	main.player.place_in_cell("cell_0001", Vector3(4, 0.05, 3), 0.0)
+	main._begin_stretch()
+	main._on_stretch_dir(1)
+	main._on_stretch_offset_step(1.0)
+	var pl2: Dictionary = main._stretch_plan()
+	check(near(pl2["cut"], 5.0) and not pl2["player_shifts"], "往後方、切線離 2 公尺：切在 z=5，玩家留在原地")
+	check(main._stretch.get("slab") != null, "擴建預覽方塊已建立")
+	main._confirm_stretch(1.5)
+	check(near(main.model.cells["cell_0001"].size.z, z2 + 1.5), "往後方擴建 1.5 公尺")
+	check(near(main.player.global_position.z, 3.0, 0.01), "玩家沒被推動")
+	check(main._stretch.is_empty(), "確認後預覽方塊清掉")
+	var x_before: float = main.model.cells["cell_0001"].size.x
+	main.player.place_in_cell("cell_0001", Vector3(4, 0.05, 3), 0.0)
+	main._begin_stretch()
+	main._on_stretch_dir(3)
+	main._confirm_stretch(1.0)
+	check(near(main.model.cells["cell_0001"].size.x, x_before + 1.0), "往右邊擴建 1 公尺（X 軸）")
+	check(near(main.player.global_position.x, 4.0, 0.01), "右邊空間在玩家前方：玩家留在原地")
+	main._begin_stretch()
+	main._end_stretch()
 
 	# 存檔 → 重新啟動 → 內容一致
 	check(main.save_now() == OK, "存檔成功")
@@ -1427,7 +1457,7 @@ func test_structure_adjust() -> void:
 	var pl = m.add_platform(c.id, Vector3(1, 0.3, 1), Vector2(2, 2), 0.3)
 	check(m.adjust_structure(pl.id, "size_x", 1.0)["changed"] and near(pl.size.x, 3.0), "平台加寬 1 m")
 	m.adjust_structure(pl.id, "size_x", 100.0)
-	check(near(pl.size.x, 7.0), "平台寬度夾在房間內（x=1 → 最多 7）")
+	check(near(pl.size.x, 8.0) and near(pl.pos.x, 0.0), "平台加寬到頂牆：整個平台往反方向閃開（寬 8、起點 x=0）")
 	m.adjust_structure(pl.id, "size_z", -100.0)
 	check(near(pl.size.y, 0.5), "平台最小 0.5 m")
 	m.adjust_structure(pl.id, "height", 0.5)
@@ -1436,17 +1466,19 @@ func test_structure_adjust() -> void:
 	check(near(pl.pos.y, 2.7), "平台高度最高到天花板下 0.3 m")
 	check(not m.adjust_structure(pl.id, "length", 1.0)["ok"], "平台沒有 length 操作")
 	m.move_structure(pl.id, Vector3(100, 0.3, -5))
-	check(near(pl.pos.x, 7.5) and near(pl.pos.z, 0.0), "平台移動後夾在房間內")
-	check(near(pl.size.x, 0.5), "平台靠邊時尺寸跟著縮到放得下")
+	check(near(pl.pos.x, 0.0) and near(pl.pos.z, 0.0) and near(pl.size.x, 8.0), "平台移動後夾在房間內，尺寸不被削短")
+	m.adjust_structure(pl.id, "size_x", -6.0)
+	m.move_structure(pl.id, Vector3(100, 0.3, -5))
+	check(near(pl.size.x, 2.0) and near(pl.pos.x, 6.0), "平台靠邊時尺寸不變，位置貼牆（x=6、寬 2）")
 
 	var rl = m.add_railing(c.id, Vector3(2, 0, 2), Vector3.RIGHT, 2.0)
 	m.adjust_structure(rl.id, "length", 1.0)
 	check(near(rl.length, 3.0), "欄桿加長")
 	m.adjust_structure(rl.id, "length", 100.0)
-	check(near(rl.length, 6.0), "欄桿長度夾在牆內（x=2 往 +X 最多 6）")
+	check(near(rl.length, 8.0) and near(rl.pos.x, 0.0), "欄桿加長頂到牆：整支往反方向閃開（長 8、起點 x=0）")
 	m.adjust_structure(rl.id, "rotate")
 	check(rl.horizontal_dir().is_equal_approx(Vector3(0, 0, 1)), "欄桿轉 90°：+X → +Z")
-	check(near(rl.length, 4.0), "轉向後長度夾到新方向可用空間（z=2 往 +Z 最多 4）")
+	check(near(rl.length, 6.0) and near(rl.pos.z, 0.0), "轉向後比房間還長：縮到房間深 6，並從 z=0 起")
 	m.adjust_structure(rl.id, "rotate")
 	m.adjust_structure(rl.id, "rotate")
 	m.adjust_structure(rl.id, "rotate")
@@ -1516,3 +1548,51 @@ func test_player_step_up() -> void:
 	player.move_input = Vector2.ZERO
 	scene.queue_free()
 	await process_frame
+
+
+# ------------------------------------------------------------------ (4c) 傳送門視圖槽位：固定綁定、不閃黑
+
+func test_portal_view_slots() -> void:
+	print("[4c] 傳送門視圖槽位固定綁定")
+	var ps = PS.new()
+	var keys_a := ["p1", "p2", "p3"]
+	var m1: Dictionary = ps._assign_views(keys_a)
+	check(m1.size() == 3 and m1["p1"] != m1["p2"] and m1["p2"] != m1["p3"], "三扇門各拿到不同視圖")
+	var keys_b := ["p3", "p1", "p2"]   # 排序變了
+	var m2: Dictionary = ps._assign_views(keys_b)
+	check(m2["p1"] == m1["p1"] and m2["p2"] == m1["p2"] and m2["p3"] == m1["p3"], "排序改變後，每扇門仍用同一個視圖（貼圖不換手）")
+	ps._views[m1["p1"]].rendered_frames = 5
+	ps._assign_views(["p2", "p3"])
+	check(ps._views[m1["p1"]].has_content(), "門暫時離開視野：視圖保留最後內容")
+	var m3: Dictionary = ps._assign_views(["p1", "p2", "p3"])
+	check(m3["p1"] == m1["p1"] and ps._views[m3["p1"]].has_content(), "門回到視野：沿用原視圖與舊畫面（不是黑的）")
+	var m4: Dictionary = ps._assign_views(["p2", "p3", "p9"])
+	check(m4["p9"] == m1["p1"], "需要新視圖時，回收沒在用的那個")
+	check(not ps._views[m4["p9"]].has_content(), "被回收的視圖重新暖機（先顯示霧色）")
+	check(PS.plan_keys([{"portal_id": "a", "parent": -1}, {"portal_id": "b", "parent": 0}])[1] == "a>b", "二級視圖的鍵含上層門")
+	ps.free()
+
+
+# ------------------------------------------------------------------ (1h) 門兩邊同步縮放
+
+func test_portal_pair_resize() -> void:
+	print("[1h] 傳送門兩邊同步縮放 / 碰牆閃開")
+	var m = SM.PalaceModel.new()
+	var a = m.create_cell("甲", "t", Vector3(10, 3, 6))
+	var b = m.create_cell("乙", "t", Vector3(4, 3, 6))   # 乙房比較窄：寬只有 4
+	var pa = m.place_portal(a.id, 3, Vector3(5, 1.1, 6), Vector2(1.2, 2.2))["portal"]
+	var pb = m.place_portal(b.id, 2, Vector3(1.0, 1.1, 0), Vector2(1.2, 2.2))["portal"]
+	check(m.link_portals(pa.id, pb.id)["ok"], "兩扇門配對")
+	check(m.partner_of(pa.id) == pb and m.partner_of(pb.id) == pa, "找得到對面那扇門")
+	var r: Dictionary = m.resize_portal(pa.id, Vector2(3.0, 2.2))
+	check(r["ok"] and r["paired"], "縮放回報有配對")
+	check(near(pa.size.x, 3.0) and near(pb.size.x, 3.0) and near(pa.size.y, pb.size.y), "改甲門寬度：乙門同步變成一樣大")
+	check(near(pb.local_pos.x, 1.5, 1e-5), "乙門靠左牆：放大時整扇往右閃開（中心 x=1.5）")
+	r = m.resize_portal(pb.id, Vector2(8.0, 2.2))
+	check(r["ok"] and near(pa.size.x, 4.0) and near(pb.size.x, 4.0), "從乙門放大：兩邊都只能到較窄那間的寬度 4")
+	check(near(pb.local_pos.x, 2.0, 1e-5), "乙門閃開到房間正中")
+	r = m.resize_portal(pa.id, Vector2(1.0, 1.0))
+	check(near(pa.size.x, 1.0) and near(pb.size.y, 1.0), "縮小也是兩邊一起")
+	# 沒有配對的門不受影響
+	var lone = m.place_portal(a.id, 0, Vector3(0, 1.1, 3), Vector2(1.0, 2.0))["portal"]
+	check(not m.resize_portal(lone.id, Vector2(2.0, 2.0))["paired"], "沒配對的門只改自己")

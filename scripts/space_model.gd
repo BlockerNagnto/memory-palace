@@ -676,7 +676,8 @@ class PalaceModel extends RefCounted:
 			return (c.size.x - s.pos.x) if dir.x > 0.0 else s.pos.x
 		return (c.size.z - s.pos.z) if dir.z > 0.0 else s.pos.z
 
-	## 把建材夾回房間內（位置、尺寸）。回傳是否有任何改變。
+	## 把建材放回房間內。碰到牆時「整個建材往反方向閃開」，不是把它削短；
+	## 只有比整間房還大時才會縮小到房間大小。回傳是否有任何改變。
 	func clamp_structure(s: Structure) -> bool:
 		var c: Cell = cells.get(s.cell_id)
 		if c == null:
@@ -684,30 +685,51 @@ class PalaceModel extends RefCounted:
 		var before := s.to_dict()
 		if s is Platform:
 			var pl: Platform = s
-			pl.pos.x = clampf(pl.pos.x, 0.0, maxf(c.size.x - MIN_STRUCT_DIM, 0.0))
-			pl.pos.z = clampf(pl.pos.z, 0.0, maxf(c.size.z - MIN_STRUCT_DIM, 0.0))
+			pl.size.x = clampf(pl.size.x, MIN_STRUCT_DIM, maxf(c.size.x, MIN_STRUCT_DIM))
+			pl.size.y = clampf(pl.size.y, MIN_STRUCT_DIM, maxf(c.size.z, MIN_STRUCT_DIM))
+			pl.pos.x = clampf(pl.pos.x, 0.0, maxf(c.size.x - pl.size.x, 0.0))
+			pl.pos.z = clampf(pl.pos.z, 0.0, maxf(c.size.z - pl.size.y, 0.0))
 			pl.pos.y = clampf(pl.pos.y, pl.thickness, maxf(c.size.y - 0.3, pl.thickness))
-			pl.size.x = clampf(pl.size.x, MIN_STRUCT_DIM, c.size.x - pl.pos.x)
-			pl.size.y = clampf(pl.size.y, MIN_STRUCT_DIM, c.size.z - pl.pos.z)
 		elif s is Ramp:
 			var r: Ramp = s
-			r.pos.x = clampf(r.pos.x, 0.0, c.size.x)
-			r.pos.z = clampf(r.pos.z, 0.0, c.size.z)
-			r.pos.y = 0.0
 			var d := r.horizontal_dir()
-			r.length = clampf(r.length, MIN_STRUCT_DIM, maxf(_max_along(c, r, d), MIN_STRUCT_DIM))
+			var along_x := absf(d.x) > 0.5
+			var along_len: float = c.size.x if along_x else c.size.z
+			var lat_len: float = c.size.z if along_x else c.size.x
+			r.length = clampf(r.length, MIN_STRUCT_DIM, maxf(along_len, MIN_STRUCT_DIM))
+			r.width = clampf(r.width, MIN_STRUCT_DIM, maxf(lat_len, MIN_STRUCT_DIM))
 			r.height = clampf(r.height, 0.2, maxf(c.size.y - 0.2, 0.2))
-			var lat := r.pos.z if absf(d.x) > 0.5 else r.pos.x
-			var lat_len := c.size.z if absf(d.x) > 0.5 else c.size.x
-			var half_max := minf(lat, lat_len - lat)
-			r.width = clampf(r.width, MIN_STRUCT_DIM, maxf(half_max * 2.0, MIN_STRUCT_DIM))
+			r.pos.y = 0.0
+			_shift_into(r, c, d, r.length)
+			if along_x:
+				r.pos.z = clampf(r.pos.z, r.width * 0.5, maxf(c.size.z - r.width * 0.5, r.width * 0.5))
+			else:
+				r.pos.x = clampf(r.pos.x, r.width * 0.5, maxf(c.size.x - r.width * 0.5, r.width * 0.5))
 		elif s is Railing:
 			var rl: Railing = s
-			rl.pos.x = clampf(rl.pos.x, 0.0, c.size.x)
-			rl.pos.z = clampf(rl.pos.z, 0.0, c.size.z)
+			var d2 := rl.horizontal_dir()
+			var len2: float = c.size.x if absf(d2.x) > 0.5 else c.size.z
+			rl.length = clampf(rl.length, MIN_STRUCT_DIM, maxf(len2, MIN_STRUCT_DIM))
 			rl.pos.y = clampf(rl.pos.y, 0.0, maxf(c.size.y - 0.5, 0.0))
-			rl.length = clampf(rl.length, MIN_STRUCT_DIM, maxf(_max_along(c, rl, rl.horizontal_dir()), MIN_STRUCT_DIM))
+			_shift_into(rl, c, d2, rl.length)
+			if absf(d2.x) > 0.5:
+				rl.pos.z = clampf(rl.pos.z, 0.0, c.size.z)
+			else:
+				rl.pos.x = clampf(rl.pos.x, 0.0, c.size.x)
 		return before != s.to_dict()
+
+	## 沿延伸方向把起點挪到「整條都在房間內」的位置
+	static func _shift_into(s: Structure, c: Cell, dir: Vector3, length: float) -> void:
+		if absf(dir.x) > 0.5:
+			if dir.x > 0.0:
+				s.pos.x = clampf(s.pos.x, 0.0, maxf(c.size.x - length, 0.0))
+			else:
+				s.pos.x = clampf(s.pos.x, minf(length, c.size.x), c.size.x)
+		else:
+			if dir.z > 0.0:
+				s.pos.z = clampf(s.pos.z, 0.0, maxf(c.size.z - length, 0.0))
+			else:
+				s.pos.z = clampf(s.pos.z, minf(length, c.size.z), c.size.z)
 
 	## 調整建材。op：
 	##   平台 size_x / size_z / height（amount = 公尺，可負）
@@ -940,7 +962,50 @@ class PalaceModel extends RefCounted:
 		var p: Variant = res.get("portal")
 		return p
 
-	## 以中心為錨點對稱調整尺寸；兩端撞到牆角或其他門時，該方向只擴張到先碰到的那一端。
+	## 縮放時「碰牆就閃開」：先把尺寸夾在該面大小內，再把中心推離牆角 / 邊界；
+	## 若推開後會壓到別的門，才退回「在原中心縮到先碰到的那一端」。
+	## 回傳 {ok, size, center(Vector2), shifted, limited_u, limited_v, reason_u, reason_v}
+	func _fit_shift(c: Cell, wall_index: int, center: Vector2, req: Vector2, exclude_id: String) -> Dictionary:
+		var dims := plane_dims(c.size, wall_index)
+		var size := Vector2(minf(req.x, dims.x), minf(req.y, dims.y))
+		var half := size * 0.5
+		var target := Vector2(clampf(center.x, half.x, dims.x - half.x), clampf(center.y, half.y, dims.y - half.y))
+		var rect := Rect2(target - half, size)
+		var clash := false
+		for r: Rect2 in _plane_rects(c, wall_index, exclude_id):
+			if _rects_overlap(rect, r):
+				clash = true
+				break
+		if not clash:
+			var lim_u := size.x < req.x - EPS
+			var lim_v := size.y < req.y - EPS
+			return {
+				"ok": true, "size": size, "center": target,
+				"shifted": not target.is_equal_approx(center),
+				"limited_u": lim_u, "limited_v": lim_v,
+				"reason_u": "wall" if lim_u else "", "reason_v": "wall" if lim_v else "",
+			}
+		var fit := _fit_rect(c, wall_index, center, req, exclude_id)
+		if fit["ok"]:
+			fit["center"] = center
+			fit["shifted"] = false
+		return fit
+
+	## 這扇門配對的另一端（單向 / 雙向都找得到）；沒有則回傳 null
+	func partner_of(portal_id: String) -> Portal:
+		var p: Portal = portals.get(portal_id)
+		if p == null:
+			return null
+		if p.target_portal_id != "" and portals.has(p.target_portal_id):
+			return portals[p.target_portal_id]
+		for oid in portals:
+			var o: Portal = portals[oid]
+			if o.target_portal_id == portal_id:
+				return o
+		return null
+
+	## 縮放傳送門：以中心為錨點對稱縮放；碰到牆就整扇往反方向閃開；
+	## 配對的另一端門「同時」縮成一樣大（兩邊取較小的可用尺寸，保持對稱）。
 	func resize_portal(portal_id: String, new_size: Vector2) -> Dictionary:
 		var p: Portal = portals.get(portal_id)
 		if p == null:
@@ -951,11 +1016,38 @@ class PalaceModel extends RefCounted:
 		if c == null:
 			return _fail("cell_not_found")
 		var req := Vector2(maxf(new_size.x, MIN_PORTAL_DIM), maxf(new_size.y, MIN_PORTAL_DIM))
-		var fit := _fit_rect(c, p.wall_index, plane_uv(p.wall_index, p.local_pos), req, p.id)
-		if not fit["ok"]:
-			return fit
-		p.size = fit["size"]
-		return fit
+		var q: Portal = partner_of(portal_id)
+		if q != null and (q.is_full_wall or not cells.has(q.cell_id)):
+			q = null
+		var cq: Cell = cells.get(q.cell_id) if q != null else null
+		var cen_p := plane_uv(p.wall_index, p.local_pos)
+		var cen_q := plane_uv(q.wall_index, q.local_pos) if q != null else Vector2.ZERO
+		var fit_p: Dictionary = {}
+		var fit_q: Dictionary = {}
+		for _i in range(4):
+			fit_p = _fit_shift(c, p.wall_index, cen_p, req, p.id)
+			if not fit_p["ok"]:
+				return fit_p
+			var got: Vector2 = fit_p["size"]
+			if q != null:
+				fit_q = _fit_shift(cq, q.wall_index, cen_q, req, q.id)
+				if not fit_q["ok"]:
+					return fit_q
+				got = Vector2(minf(got.x, fit_q["size"].x), minf(got.y, fit_q["size"].y))
+			if got.is_equal_approx(fit_p["size"]) and (q == null or got.is_equal_approx(fit_q["size"])):
+				break
+			req = got
+		p.size = fit_p["size"]
+		p.local_pos = plane_point(c.size, p.wall_index, fit_p["center"].x, fit_p["center"].y)
+		var res := fit_p.duplicate()
+		res["paired"] = q != null
+		if q != null:
+			q.size = fit_q["size"]
+			q.local_pos = plane_point(cq.size, q.wall_index, fit_q["center"].x, fit_q["center"].y)
+			res["shifted"] = bool(fit_p["shifted"]) or bool(fit_q["shifted"])
+		res["limited_u"] = absf(p.size.x - new_size.x) > EPS and new_size.x >= MIN_PORTAL_DIM
+		res["limited_v"] = absf(p.size.y - new_size.y) > EPS and new_size.y >= MIN_PORTAL_DIM
+		return res
 
 	## 平移傳送門（尺寸不變）。超出牆面時滑到邊界並標記 limited；與其他門重疊則拒絕且不改動。
 	func move_portal(portal_id: String, new_pos: Vector3) -> Dictionary:
@@ -988,6 +1080,10 @@ class PalaceModel extends RefCounted:
 		p.local_pos = plane_point(c.size, p.wall_index, dims.x * 0.5, dims.y * 0.5)
 
 	# ---------------------------------------------------------------- Split & Stretch
+
+	## 擴建時，座標在切線「正側（含壓線）」的東西會被整體推開 delta；玩家適用同一條規則
+	static func shifts_with_stretch(coord: float, cut: float) -> bool:
+		return coord >= cut - EPS
 
 	static func _coord(v: Vector3, axis: int) -> float:
 		return v.x if axis == AXIS_X else v.z

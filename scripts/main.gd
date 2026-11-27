@@ -39,7 +39,7 @@ const ERROR_TEXT := {
 	"full_wall": "這面牆放不下門",
 	"orientation_mismatch": "門的方向不相容",
 	"horizontal_needs_floor_and_ceiling": "上下樓的門必須是「地板」配「天花板」",
-	"no_room_for_resize": "已到上限：碰到牆角或別的門了",
+	"no_room_for_resize": "已到上限：這間或對面那間放不下更大的門了",
 }
 
 var model = null
@@ -124,6 +124,9 @@ func _connect_signals() -> void:
 	hud.door_requested.connect(_on_door_requested)
 	hud.stretch_begin_requested.connect(_begin_stretch)
 	hud.stretch_changed.connect(_on_stretch_changed)
+	hud.stretch_dir_requested.connect(_on_stretch_dir)
+	hud.stretch_offset_step.connect(_on_stretch_offset_step)
+	hud.stretch_crosshair_requested.connect(_on_stretch_crosshair)
 	hud.stretch_confirmed.connect(_confirm_stretch)
 	hud.stretch_cancelled.connect(_end_stretch)
 	hud.node_saved.connect(_on_node_saved)
@@ -693,33 +696,75 @@ func _stairs_down() -> void:
 
 # ====================================================================== 擴建（Split & Stretch）
 
-func _stretch_axis_and_cut(delta: float) -> Dictionary:
-	var cell = model.cells[player.current_cell_id]
-	var f := _facing_dir()
-	var axis: int = SM.PalaceModel.AXIS_X if absf(f.x) >= absf(f.z) else SM.PalaceModel.AXIS_Z
+const STRETCH_MIN_OFFSET := 0.3
+const STRETCH_DIR_NAMES := ["前方", "後方", "左邊", "右邊"]
+
+
+static func _cardinal(v: Vector3) -> Vector3:
+	if absf(v.x) >= absf(v.z) and absf(v.x) > 1e-6:
+		return Vector3(signf(v.x), 0.0, 0.0)
+	if absf(v.z) > 1e-6:
+		return Vector3(0.0, 0.0, signf(v.z))
+	return Vector3(0.0, 0.0, -1.0)
+
+
+## 以目前視角為準，把「前 / 後 / 左 / 右」換成房間座標軸上的方向（單位向量）
+func _stretch_dir_vec(kind: int) -> Vector3:
+	var f := _cardinal(_facing_dir())
+	match kind:
+		1:
+			return -f
+		2:
+			return Vector3(f.z, 0.0, -f.x)
+		3:
+			return Vector3(-f.z, 0.0, f.x)
+		_:
+			return f
+
+
+## 目前擴建設定換算成：沿哪條軸、切線在哪、玩家會不會被推到另一側
+func _stretch_plan() -> Dictionary:
+	var cell = model.cells[_stretch["cell"]]
+	var v: Vector3 = _stretch["vec"]
+	var axis: int = SM.PalaceModel.AXIS_X if absf(v.x) > 0.5 else SM.PalaceModel.AXIS_Z
+	var sgn: float = v.x if axis == SM.PalaceModel.AXIS_X else v.z
 	var coord: float = player.global_position.x if axis == SM.PalaceModel.AXIS_X else player.global_position.z
-	var sign_f: float = f.x if axis == SM.PalaceModel.AXIS_X else f.z
 	var length: float = cell.size.x if axis == SM.PalaceModel.AXIS_X else cell.size.z
-	# 往正方向看：切線在腳下，新空間在前方；往負方向看：新空間要在前方 → 切線在 coord − delta
-	var cut := coord if sign_f >= 0.0 else coord - delta
-	return {"axis": axis, "cut": clampf(cut, 0.1, length), "valid": cut >= 0.1 and cut <= length + 1e-4}
+	var raw: float = coord + sgn * float(_stretch["offset"])
+	var cut := clampf(raw, 0.1, length)
+	return {
+		"axis": axis, "sign": sgn, "coord": coord, "cut": cut, "length": length,
+		"delta": float(_stretch["delta"]),
+		"clamped": absf(raw - cut) > 1e-4,
+		"player_shifts": SM.PalaceModel.shifts_with_stretch(coord, cut),
+	}
 
 
 func _begin_stretch() -> void:
-	var cid: String = player.current_cell_id
-	var delta := 2.0
-	var ac := _stretch_axis_and_cut(delta)
-	_stretch = {"cell": cid, "delta": delta, "pv1": null, "pv2": null}
+	_end_stretch()
+	_stretch = {"cell": player.current_cell_id, "delta": 2.0, "offset": 1.0, "kind": 0,
+		"vec": _stretch_dir_vec(0), "slab": null, "sig": ""}
 	_update_stretch_preview()
-	hud.show_stretch(_stretch_info_text(ac), delta)
+	hud.show_stretch(_stretch_info_text(), 2.0, 0)
 
 
-func _stretch_info_text(ac: Dictionary) -> String:
-	var axis_name := "前後（X）" if ac["axis"] == SM.PalaceModel.AXIS_X else "前後（Z）"
-	var txt := "在目前位置沿 %s 方向，從 %.1f 公尺處切開" % [axis_name, ac["cut"]]
-	if not ac["valid"]:
-		txt += "\n（前方空間不足，請往後退一點再試）"
+func _stretch_info_text() -> String:
+	var pl := _stretch_plan()
+	var kind: int = _stretch["kind"]
+	var txt := "新空間在你的%s，深 %.1f 公尺；切線離你 %.1f 公尺。" % [STRETCH_DIR_NAMES[kind], pl["delta"], absf(pl["cut"] - pl["coord"])]
+	if pl["clamped"]:
+		txt += "\n（切線已貼到牆邊）"
+	if pl["player_shifts"]:
+		txt += "\n你會跟著被推到新空間的另一側。"
+	else:
+		txt += "\n你會留在原地。"
+	txt += "\n綠色方塊 = 即將多出來的空間。"
 	return txt
+
+
+func _refresh_stretch_ui() -> void:
+	_update_stretch_preview()
+	hud.update_stretch(_stretch_info_text(), _stretch["delta"], _stretch["kind"])
 
 
 func _update_stretch_preview() -> void:
@@ -730,50 +775,86 @@ func _update_stretch_preview() -> void:
 	var node: Node3D = cell_nodes.get(cid)
 	if node == null:
 		return
-	var delta: float = _stretch["delta"]
-	var ac := _stretch_axis_and_cut(delta)
-	for key in ["pv1", "pv2"]:
-		var cut_at: float = ac["cut"] if key == "pv1" else ac["cut"] + delta
-		var pv: MeshInstance3D = _stretch[key]
-		if pv == null:
-			pv = RB.make_cut_preview(cell.size, ac["axis"], cut_at)
-			node.add_child(pv)
-			RB.apply_layers(pv, cell.render_layer, 0)
-			_stretch[key] = pv
-		else:
-			RB.update_cut_preview(pv, cell.size, ac["axis"], cut_at)
+	var pl := _stretch_plan()
+	var sig := "%d|%.3f|%.3f" % [pl["axis"], pl["cut"], pl["delta"]]
+	if sig == _stretch["sig"] and _stretch["slab"] != null:
+		return
+	_stretch["sig"] = sig
+	var pv: MeshInstance3D = _stretch["slab"]
+	if pv == null:
+		pv = RB.make_slab_preview(cell.size, pl["axis"], pl["cut"], pl["delta"])
+		node.add_child(pv)
+		RB.apply_layers(pv, cell.render_layer, 0)
+		_stretch["slab"] = pv
+	else:
+		RB.update_slab_preview(pv, cell.size, pl["axis"], pl["cut"], pl["delta"])
+
+
+func _on_stretch_dir(kind: int) -> void:
+	if _stretch.is_empty():
+		return
+	_stretch["kind"] = kind
+	_stretch["vec"] = _stretch_dir_vec(kind)
+	_refresh_stretch_ui()
 
 
 func _on_stretch_changed(delta: float) -> void:
 	if _stretch.is_empty():
 		return
 	_stretch["delta"] = delta
-	_update_stretch_preview()
-	hud.show_stretch(_stretch_info_text(_stretch_axis_and_cut(delta)), delta)
+	_refresh_stretch_ui()
 
 
-func _confirm_stretch(delta: float) -> void:
+func _on_stretch_offset_step(step: float) -> void:
 	if _stretch.is_empty():
 		return
-	var cid: String = _stretch["cell"]
-	var ac := _stretch_axis_and_cut(delta)
-	_end_stretch()
-	if not ac["valid"]:
-		hud.toast("前方空間不足，沒有拉開")
+	_stretch["offset"] = clampf(float(_stretch["offset"]) + step, STRETCH_MIN_OFFSET, 30.0)
+	_refresh_stretch_ui()
+
+
+## 把切線設在準心對準的位置（沿目前選的方向量距離）
+func _on_stretch_crosshair() -> void:
+	if _stretch.is_empty():
 		return
-	var r: Dictionary = model.split_and_stretch(cid, ac["axis"], ac["cut"], delta)
+	var vp := get_viewport().get_visible_rect().size
+	var hit: Dictionary = player.raycast_surface(vp * 0.5)
+	if hit.is_empty():
+		hud.toast("準心沒有對到任何東西")
+		return
+	var v: Vector3 = _stretch["vec"]
+	var d: float = (hit["position"] - player.global_position).dot(v)
+	if d < STRETCH_MIN_OFFSET:
+		hud.toast("準心要對在新空間那一側的前方")
+		return
+	_stretch["offset"] = snappedf(d, 0.1)
+	_refresh_stretch_ui()
+
+
+func _confirm_stretch(delta: float = -1.0) -> void:
+	if _stretch.is_empty():
+		return
+	if delta > 0.0:
+		_stretch["delta"] = delta
+	var cid: String = _stretch["cell"]
+	var pl := _stretch_plan()
+	_end_stretch()
+	var r: Dictionary = model.split_and_stretch(cid, pl["axis"], pl["cut"], pl["delta"])
 	if not r["ok"]:
 		hud.toast("無法擴建（%s）" % str(r.get("error", "?")))
 		return
+	# 玩家和其他東西同一條規則：在切線正側的整個被推開
+	if pl["player_shifts"] and player.current_cell_id == cid:
+		var push := Vector3(pl["delta"], 0.0, 0.0) if pl["axis"] == SM.PalaceModel.AXIS_X else Vector3(0.0, 0.0, pl["delta"])
+		player.global_position += push
 	_rebuild_cell(cid)
 	portal_system.refresh()
 	_mark_dirty()
-	hud.toast("已拉開 %.1f 公尺的新空間" % delta)
+	hud.toast("已拉開 %.1f 公尺的新空間" % pl["delta"])
 
 
 func _end_stretch() -> void:
-	for key in ["pv1", "pv2"]:
-		var pv = _stretch.get(key)
+	if not _stretch.is_empty():
+		var pv = _stretch.get("slab")
 		if pv != null and is_instance_valid(pv):
 			pv.queue_free()
 	_stretch = {}
@@ -832,6 +913,11 @@ func save_now() -> Error:
 
 
 func _process(delta: float) -> void:
+	if not _stretch.is_empty():
+		var old_sig: String = _stretch["sig"]
+		_update_stretch_preview()
+		if _stretch["sig"] != old_sig:
+			hud.update_stretch(_stretch_info_text(), _stretch["delta"], _stretch["kind"])
 	if _dirty:
 		_save_timer -= delta
 		if _save_timer <= 0.0:
@@ -1150,7 +1236,7 @@ func _show_portal_panel(p) -> void:
 	var hlab := "長" if horiz else "高"
 	var linked := "已連通" if p.target_portal_id != "" else "尚未連通"
 	var kind_name := "地板開口" if p.wall_index == 4 else ("天花板開口" if p.wall_index == 5 else "牆上的門")
-	var info := "%s　%s %.1f × %s %.1f 公尺　（%s）\n從中心往兩側對稱縮放；碰到牆角或別的門就會停住。" % [kind_name, wlab, p.size.x, hlab, p.size.y, linked]
+	var info := "%s　%s %.1f × %s %.1f 公尺　（%s）\n從中心往兩側縮放，碰到牆會自動挪開；連通的另一邊會同時變成一樣大。" % [kind_name, wlab, p.size.x, hlab, p.size.y, linked]
 	var rows: Array = [
 		[[wlab + " -", "pw-"], [wlab + " +", "pw+"], [hlab + " -", "ph-"], [hlab + " +", "ph+"]],
 	]
@@ -1236,6 +1322,8 @@ func _portal_action(action: String) -> void:
 				hud.toast(_error_text(r))
 				return
 			changed = not p.size.is_equal_approx(before)
+			if changed and r.get("shifted", false):
+				hud.toast("碰到牆了，門自動往反方向挪開")
 			if not changed and d > 0.0:
 				hud.toast(ERROR_TEXT["no_room_for_resize"])
 		"pm:left", "pm:right", "pm:forward", "pm:back", "pm:up", "pm:down":
@@ -1289,6 +1377,9 @@ func _portal_action(action: String) -> void:
 			return
 	if changed:
 		_rebuild_cell(cid)
+		var mate = model.partner_of(p.id) if model.portals.has(p.id) else null
+		if mate != null and mate.cell_id != cid and cell_nodes.has(mate.cell_id):
+			_rebuild_cell(mate.cell_id)   # 對面那扇門也一起變了
 		portal_system.refresh()
 		_mark_dirty()
 	_refresh_target()

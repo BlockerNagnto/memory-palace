@@ -519,3 +519,61 @@ static func _cut_preview_mesh(cell_size: Vector3, axis: int, cut: float) -> Arra
 	edge.render_priority = 11
 	mesh.surface_set_material(1, edge)
 	return mesh
+
+
+## 擴建預覽：沿 axis 從 cut 到 cut+delta 的「新空間」半透明方塊（含邊框線），截面與房間同大
+static func make_slab_preview(cell_size: Vector3, axis: int, cut: float, delta: float) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.name = "StretchSlab"
+	mi.mesh = _slab_mesh(cell_size, axis, cut, delta)
+	return mi
+
+
+static func update_slab_preview(mi: MeshInstance3D, cell_size: Vector3, axis: int, cut: float, delta: float) -> void:
+	mi.mesh = _slab_mesh(cell_size, axis, cut, delta)
+
+
+static func _slab_mesh(cell_size: Vector3, axis: int, cut: float, delta: float) -> ArrayMesh:
+	var lo := Vector3.ZERO
+	var hi := cell_size
+	if axis == SM.PalaceModel.AXIS_X:
+		lo.x = cut
+		hi.x = cut + delta
+	else:
+		lo.z = cut
+		hi.z = cut + delta
+	var v: Array = []
+	for i in range(8):
+		v.append(Vector3(hi.x if (i & 1) != 0 else lo.x, hi.y if (i & 2) != 0 else lo.y, hi.z if (i & 4) != 0 else lo.z))
+	var faces := [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]]
+	var tris := PackedVector3Array()
+	for f in faces:
+		for idx in [0, 1, 2, 0, 2, 3]:
+			tris.push_back(v[f[idx]])
+	var mesh := ArrayMesh.new()
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = tris
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var fill := StandardMaterial3D.new()
+	fill.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	fill.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	fill.albedo_color = Color(0.30, 0.85, 0.65, 0.22)
+	fill.cull_mode = BaseMaterial3D.CULL_DISABLED
+	fill.render_priority = 10
+	mesh.surface_set_material(0, fill)
+	var edges := [[0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [2, 6], [3, 7]]
+	var lines := PackedVector3Array()
+	for e in edges:
+		lines.append(v[e[0]])
+		lines.append(v[e[1]])
+	var la := []
+	la.resize(Mesh.ARRAY_MAX)
+	la[Mesh.ARRAY_VERTEX] = lines
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, la)
+	var edge := StandardMaterial3D.new()
+	edge.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	edge.albedo_color = Color(0.6, 1.0, 0.85, 1.0)
+	edge.render_priority = 11
+	mesh.surface_set_material(1, edge)
+	return mesh
